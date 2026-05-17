@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/handoff", "crates/handoff-supervisor"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+handoff = { path = "crates/handoff" }
+
+libc = "0.2"
+nix = { version = "0.30", default-features = false, features = ["fs", "socket", "uio", "process", "signal"] }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

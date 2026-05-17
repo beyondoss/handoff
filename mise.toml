@@ -1,0 +1,26 @@
+[tools]
+rust = { version = "1.92", components = "rustfmt,clippy" }
+
+[tasks."build:rs"]
+run = "cargo build --workspace"
+
+[tasks."build:rs:release"]
+run = "cargo build --workspace --release"
+
+[tasks."check:rs"]
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks."check:fmt"]
+run = "cargo fmt --all --check"
+
+[tasks."format"]
+run = "cargo fmt --all"
+
+[tasks."test:unit:rs"]
+run = "cargo test --workspace --lib"
+
+[tasks."test:integration:rs"]
+run = "cargo test --workspace --tests"
+
+[tasks."test"]
+run = "cargo test --workspace"
