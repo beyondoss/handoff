@@ -3,8 +3,10 @@
 //! See the crate-root `ARCHITECTURE.md` for the wire protocol, state machine,
 //! and correctness invariants. This module re-exports the public surface.
 
+pub mod crash;
 pub mod drainable;
 pub mod error;
+pub mod fd;
 pub mod frame;
 pub mod incumbent;
 pub mod lock;
@@ -16,6 +18,7 @@ pub mod supervisor;
 
 pub use drainable::{DrainReport, Drainable, ReadinessSnapshot, SealReport, StateSnapshot};
 pub use error::{Error, Result};
+pub use fd::arrange_inherited_fds_on_spawn;
 pub use incumbent::Incumbent;
 pub use lock::DataDirLock;
 pub use protocol::HandoffId;

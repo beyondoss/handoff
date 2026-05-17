@@ -48,7 +48,10 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<(ProtoVersion, Message)> {
     let mut len_buf = [0u8; LEN_PREFIX];
     r.read_exact(&mut len_buf)?;
     let frame_len = u32::from_le_bytes(len_buf);
-    if frame_len < VERSION_FIELD as u32 || frame_len > MAX_FRAME_BYTES {
+    if frame_len < VERSION_FIELD as u32 {
+        return Err(Error::FrameMalformed(frame_len));
+    }
+    if frame_len > MAX_FRAME_BYTES {
         return Err(Error::FrameTooLarge(frame_len));
     }
 
@@ -140,7 +143,7 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         assert!(matches!(
             read_message(&mut cursor),
-            Err(Error::FrameTooLarge(_))
+            Err(Error::FrameMalformed(_))
         ));
     }
 }

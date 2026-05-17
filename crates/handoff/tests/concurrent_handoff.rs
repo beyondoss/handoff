@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use handoff::frame::{read_message, write_message};
 use handoff::protocol::{HandoffId, Message, PROTO_MAX};
 use handoff::{DataDirLock, Incumbent};
 
-use common::MockDrainable;
+use common::{MockDrainable, connect_with_retry};
 
 #[test]
 fn second_prepare_with_different_id_is_rejected() {
@@ -21,7 +20,7 @@ fn second_prepare_with_different_id_is_rejected() {
     let data_dir = temp.path().join("data");
 
     let lock = DataDirLock::acquire(&data_dir).unwrap();
-    let incumbent = Incumbent::bind(&sock_path, lock).unwrap();
+    let incumbent = Incumbent::bind_cold_start(&sock_path, lock).unwrap();
 
     let drainable = MockDrainable::default();
     let server_thread = thread::spawn(move || incumbent.serve(drainable));
@@ -80,17 +79,4 @@ fn second_prepare_with_different_id_is_rejected() {
 
     drop(stream);
     drop(server_thread); // detach; serve() will keep running until process exit
-}
-
-fn connect_with_retry(path: &std::path::Path) -> UnixStream {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match UnixStream::connect(path) {
-            Ok(s) => return s,
-            Err(_) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("connect failed: {e}"),
-        }
-    }
 }

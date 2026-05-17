@@ -1,9 +1,27 @@
 //! Shared test helpers for handoff integration tests.
 
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use handoff::{DrainReport, Drainable, SealReport, StateSnapshot};
+
+/// Connect to a Unix socket, retrying briefly while the server thread is
+/// still binding. Used by every integration test in this crate that opens a
+/// freshly-spawned [`handoff::Incumbent`].
+#[allow(dead_code)]
+pub fn connect_with_retry(path: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(s) => return s,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("connect failed: {e}"),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct MockState {

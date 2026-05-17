@@ -1,96 +1,371 @@
-# handoff architecture
+# handoff Architecture
 
-A daemon-side library + a reference supervisor binary that together perform a zero-downtime in-place binary swap of a running stateful process.
+Takes a running stateful daemon (incumbent), drains its in-flight connections, seals its on-disk state, and hands listener FDs + data-dir ownership to a freshly-spawned successor binary — with no TCP connections dropped and no acked writes lost.
 
 ## Roles
 
-- **S** — supervisor. Binds the listen sockets at first cold start and holds the FDs for the lifetime of its own process. Spawns each successive primitive process, inheriting the listeners via `LISTEN_FDS` env vars. Drives the swap protocol.
-- **O** — old incumbent. The primitive process currently serving traffic and holding the data-dir flock.
-- **N** — new successor. Spawned by S during a swap. Starts up, waits for `Begin`, takes the flock, opens state, declares ready.
+Three processes participate in any swap:
 
-## Wire protocol
+| Role | Symbol | What It Owns | Lifetime |
+|------|--------|--------------|----------|
+| Supervisor | S | Bound listener FDs, spawn policy | Entire service lifetime |
+| Incumbent | O | Data-dir flock, active writer segments, accept loop | Until `Commit` received |
+| Successor | N | Nothing until `Begin` | Spawned by S; takes ownership on `Begin` |
 
-Length-prefixed frames over a Unix-domain socket:
+The supervisor is the only long-lived process. Primitives (O and N) come and go; the supervisor's FDs keep the kernel-side sockets open across swaps so the accept queue absorbs gaps.
 
-```
-u32 length || u16 proto_version || u16 msg_type || postcard payload
-```
+## Data Flow
 
-Listener FDs are never sent over this socket — they flow via env-var inheritance at process spawn (same convention as systemd socket activation).
-
-| #   | Name               | Direction   | Payload                                                                       |
-| --- | ------------------ | ----------- | ----------------------------------------------------------------------------- |
-| 1   | `Hello`            | O↔S, N↔S    | role, pid, build_id, proto_min, proto_max, capabilities                       |
-| 2   | `HelloAck`         | S→peer      | proto_version_chosen, handoff_id (uuid)                                       |
-| 3   | `PrepareHandoff`   | S→O         | handoff_id, successor_pid, deadline_ms, drain_grace_ms                        |
-| 4   | `Drained`          | O→S         | open_conns_remaining, accept_closed                                           |
-| 5   | `SealRequest`      | S→O         | handoff_id                                                                    |
-| 6   | `SealProgress`     | O→S         | shards_sealed, shards_total, last_revision (heartbeat while sealing)          |
-| 7   | `SealComplete`     | O→S         | handoff_id, last_revision_per_shard, data_dir_fingerprint                     |
-| 8   | `SealFailed`       | O→S         | handoff_id, error, partial_state                                              |
-| 9   | `Begin`            | S→N         | handoff_id (cue for N to acquire flock, open state, start serving)            |
-| 10  | `Ready`            | N→S         | handoff_id, listening_on, healthz_ok, advertised_revision_per_shard           |
-| 11  | `Commit`           | S→O         | handoff_id                                                                    |
-| 12  | `Abort`            | S→{O,N}     | handoff_id, reason                                                            |
-| 13  | `ResumeAfterAbort` | S→O         | handoff_id                                                                    |
-| 14  | `Heartbeat`        | both        | ts (every 1s during handoff)                                                  |
-
-## Happy-path sequence
+### Happy path
 
 ```
-[steady state: O has flock, S has listener FDs]
-
-S spawns N with env HANDOFF_SOCK_FD=<n>, HANDOFF_ROLE=successor,
-                    LISTEN_FDS=2, LISTEN_FDNAMES=resp:http  (FDs 3, 4)
-N→S: Hello(successor)   ; S→N: HelloAck
-O→S: Hello(incumbent)   ; S→O: HelloAck   (already established at O's startup)
-
-S→O: PrepareHandoff
-  O: stop calling accept(); cancel background tasks; drain in-flight RESP/HTTP;
-     reject new writes on remaining conns; continue serving reads
-O→S: Drained(open_conns_remaining)
-
-S→O: SealRequest
-  O: per shard — flush, write footer, fsync, close active file
-  O: release data-dir flock                             ← critical ordering
-O→S: SealProgress* (heartbeats while sealing)
-O→S: SealComplete(last_revision_per_shard)
-
-S→N: Begin
-  N: take_listener("resp" | "http") via from_raw_fd
-  N: acquire data-dir flock                             ← always succeeds
-  N: open state from sealed snapshot, start accept loop
-N→S: Ready(advertised_revision_per_shard)
-
-S→O: Commit
-  O: drain remaining read conns (bounded by grace timeout)
-  O: exit(0)
+TRIGGER arrives at supervisor
+        │
+        ▼
+S: try_lock(in_flight)? ──HELD──► Error::HandoffInProgress (caller)
+        │
+      ACQUIRED
+        │
+        ▼
+S connects to O's Unix socket
+O → S: Hello(incumbent, pid, build_id, proto range)
+S → O: HelloAck(chosen_version, handoff_id)
+        │
+        ▼
+S creates socketpair(S-end, N-end)
+S forks+execs N with:
+  HANDOFF_ROLE=successor
+  HANDOFF_SOCK_FD=<n_end_fd>
+  LISTEN_FDS=<count>       (listener FDs dup2'd to FD 3, 4, …)
+  LISTEN_FDNAMES=<names>
+        │
+        ▼
+N → S: Hello(successor, pid)
+S → N: HelloAck(chosen_version, handoff_id)   ← S verifies pid matches spawned child
+        │
+        ▼
+        │── DRAIN ──────────────────────────────────────────────────────┐
+        │                                                                │
+S → O: PrepareHandoff(handoff_id, successor_pid, deadline_ms,          │
+                       drain_grace_ms)                                  │
+O: stops calling accept(); cancels background tasks;                   │
+   drains in-flight RESP/HTTP; fsyncs (no acked write lost)            │
+O → S: Drained(open_conns_remaining, accept_closed)                    │
+        │                                                                │
+        │── SEAL ─────────────────────────────────────────────────────  │
+        │                                                                │
+S → O: SealRequest(handoff_id)                                         │
+O: per shard — flush, write footer, fsync, close segment               │
+O: drops DataDirLock (flock released ← critical ordering)             │
+O → S: SealComplete(handoff_id, last_revision_per_shard,               │
+                    data_dir_fingerprint)                               │
+        │                                                                │
+        │── BEGIN / READY ────────────────────────────────────────────  │
+        │                                                                │
+S → N: Begin(handoff_id)                                               │
+N: take_listener("resp"|"http") from inherited FDs                     │
+N: acquire DataDirLock (always succeeds — O released it)              │
+N: open state from sealed snapshot; start accept loop                  │
+N → S: Ready(handoff_id, listening_on, healthz_ok,                     │
+             advertised_revision_per_shard)                            │
+        │                                                                │
+        │── COMMIT ───────────────────────────────────────────────────  │
+        │                                                                │
+S → O: Commit(handoff_id)                                              │
+O: drains remaining read conns (bounded by grace timeout); exit(0)    │
+S: disarms ChildGuard, returns HandoffOutcome{committed:true, child:N} │
+        └────────────────────────────────────────────────────────────────┘
 ```
 
-The transition order is the load-bearing piece: **O releases the flock immediately after sealing, not at exit.** O has no remaining writes post-seal; it serves in-flight reads from sealed files until `Commit`.
+### Abort paths
 
-## Abort paths
+```
+Abort trigger (any phase)
+        │
+        ├─ N crashes before Ready ──► kernel releases N's flock FD
+        │                             S sends ResumeAfterAbort → O
+        │                             O re-acquires flock, calls resume_after_abort
+        │
+        ├─ N doesn't send Ready before deadline_ms
+        │         S sends Abort → N (SIGTERM → SIGKILL)
+        │         S sends ResumeAfterAbort → O
+        │         O re-acquires flock, calls resume_after_abort
+        │
+        ├─ O sends SealFailed (flock still held by O)
+        │         S sends Abort → N (kill + reap)
+        │         O calls resume_after_abort immediately (re-opens writer)
+        │         Returns HandoffOutcome{committed:false}
+        │
+        └─ S crashes during handoff
+                  N exits when its socketpair end closes (EOF)
+                  O observes EOF on control socket:
+                    if sealed → re-acquire flock + call resume_after_abort
+                    if only drained → call resume_after_abort (flock still held)
+                  S on restart → resume_from_journal():
+                    verifies O is reachable; clears journal file
 
-- **N crashes after `Begin`, before `Ready`:** N held the flock briefly; kernel releases on N exit. S sends `ResumeAfterAbort` to O. O re-acquires the flock, opens fresh active segments, restarts accept loop.
-- **N's `Ready` doesn't arrive by `deadline_ms`:** S sends `Abort` to N (SIGTERM then SIGKILL), then `ResumeAfterAbort` to O.
-- **O's `seal()` errors mid-handoff:** O sends `SealFailed{partial_state}`. O has not released flock. S aborts N. O resumes accepting from its partial state.
-- **S crashes during handoff:** Both O and N watch a 5s heartbeat. On disconnect, the flock-holder keeps serving; the other exits with code 75 (EX_TEMPFAIL). S on restart reconstructs state from `/var/lib/beyond/handoff/<svc>/state.json`.
-- **Concurrent handoff attempts:** S guards with an in-process mutex plus `/run/beyond/<primitive>/handoff.lock`. O rejects a second `PrepareHandoff` with a different `handoff_id`.
-- **Data-dir flock held by zombie:** `acquire_or_break_stale` checks the pidfile, verifies liveness via `pidfd_open`, breaks the lock only if the holder PID is dead.
+ChildGuard (Rust RAII) ──► kills + reaps N on any early return from
+                            perform_handoff; disarmed only on Commit
+```
 
-## Correctness invariants
+## Concepts & Terminology
 
-1. At most one process holds the flock at any time.
-2. Flock is released only after seal succeeds, or after a seal-failure that leaves no committed-but-orphaned state.
-3. No acked write is lost across a handoff. The `Drainable::drain` impl must fsync before announcing `Drained`.
-4. Listener never goes "down" from the kernel's perspective; the accept queue absorbs the gap between O's last accept and N's first accept.
-5. Successor refuses to start writing until the flock is held.
-6. Aborted handoff returns the system to the pre-handoff state with no leaks.
-7. The protocol is resumable from any acknowledged state on supervisor restart (state journal at `/var/lib/beyond/handoff/<svc>/state.json`).
+| Term | What It Controls | NOT |
+|------|-----------------|-----|
+| `Supervisor` | Spawns successors, drives the protocol, serializes handoffs via `Mutex` | Not a process supervisor like systemd; it's embedded in code |
+| `Incumbent` | The Unix socket server inside the primitive process; runs `serve()` on a dedicated thread | Not the process itself — it's a library object the daemon spawns a thread for |
+| `Drainable` | Consumer contract: the three lifecycle hooks S calls on O during a swap | Not a generic drain abstraction; specific to handoff ordering |
+| `DataDirLock` | RAII `flock(LOCK_EX)` on `<data_dir>/.handoff.lock` + atomic pidfile | Not a mutex; cross-process kernel lock; held by exactly one primitive |
+| `HandoffId` | UUID assigned by S in `HelloAck`; tags every message in one swap | Not a transaction id; not persisted to the data dir |
+| `Phase` | Journal state machine value; written atomically after each protocol step | Not an in-memory state variable; only used for crash recovery |
+| `ChildGuard` | Kills + reaps the spawned child if `perform_handoff` exits early | Not visible outside `supervisor.rs`; pure RAII safety net |
+| `InheritedListeners` | FD map populated from `LISTEN_FDS`/`LISTEN_FDNAMES`; consumed by `take()` | Not a listener pool; once taken, the entry is gone |
+| Seal | Per-shard: flush buffer, write segment footer, fsync, close file | Not a DB-style "seal" on rows; it's the WAL segment close operation |
+| Drain | Stop accepting, finish in-flight requests, fsync — before seal | Not a graceful shutdown; O keeps serving reads after drain |
+
+## Core Mechanisms
+
+### Listener inheritance
+
+The supervisor binds sockets once at cold start and passes them to every child via `pre_exec` FD dup2 (FDs 3, 4, … in `LISTEN_FDS` order). The control socket goes to `FD 3 + len(listeners)`. Each spawned child receives a clean FD table with exactly these FDs preserved; all other FDs are CLOEXEC and close on exec. See `supervisor.rs:spawn_successor()`.
+
+The kernel-level socket (and its accept queue) is never closed. Connections arriving during the O→N transition queue in the kernel and N's first `accept()` picks them up. The listen socket never goes "down" from a client's perspective.
+
+### Flock ordering (the load-bearing piece)
+
+O releases the flock in `SealRequest` handling (`incumbent.rs:run_session_loop`), immediately after `drainable.seal()` succeeds — before sending `SealComplete`, before receiving `Commit`, before exiting. This is the critical ordering:
+
+1. O's seal writes and fsyncs all data. No further writes possible.
+2. O drops `DataDirLock` (RAII: closes the flock FD).
+3. S sends `Begin` to N.
+4. N calls `DataDirLock::acquire()` — always succeeds because O released it.
+5. N opens sealed state, starts accepting.
+
+If the flock were held until `Commit`, step 4 would block (or fail) until O exited, forcing N to wait. Releasing it right after seal is safe because O has nothing left to write.
+
+### Wire framing
+
+Every message is a length-prefixed frame over a `UnixStream`:
+
+```
+[0..4]  u32 frame_len  (little-endian; covers bytes 4..4+frame_len)
+[4..6]  u16 proto_version
+[6..]   postcard-encoded Message variant
+```
+
+Frame size is capped at 1 MiB (`MAX_FRAME_BYTES`) to bound allocation on the reader side. The `Message` enum's variant discriminant is encoded by postcard as part of the payload — no separate type byte. See `frame.rs`.
+
+### Protocol negotiation
+
+Both sides announce `proto_min`/`proto_max` in `Hello`. `negotiate_version()` picks the highest version in the intersection. If ranges are disjoint, returns `Error::VersionMismatch` and the connection is closed before any handoff begins. Currently only version 1 exists (`PROTO_MIN == PROTO_MAX == 1`).
+
+### Journal (crash recovery)
+
+After each acknowledged protocol step, S writes a `StateJournal` to disk atomically (write `.bin.tmp` → rename). On restart, `resume_from_journal()` reads the file, verifies O is reachable (opens control socket, reads one frame, drops), then deletes the journal. The incumbent auto-recovers from disconnect in all phases; the journal gives S enough context to log what happened and start clean.
+
+Journal writes use `postcard` serialization; the rename makes each write crash-safe on POSIX filesystems.
+
+### Stale lock breaking
+
+`DataDirLock::acquire_or_break_stale()` handles the case where the lockfile holds a PID that is no longer alive:
+
+1. Try `acquire()`. If it succeeds, done.
+2. If `LockHeld`, read the pidfile and call `kill(pid, 0)`.
+3. If the PID is dead: unlink the lockfile and pidfile, then `acquire()` on the fresh inode. The kernel already released the flock when the holder died; removing the artifacts is cosmetic.
+4. If the PID is alive: return `StaleLockBreakRefused`. Never break a live holder.
+
+See `lock.rs:acquire_or_break_stale()`.
+
+## State Machine
+
+### Journal phase machine (supervisor-side)
+
+```
+Idle ──start──► Negotiating ──drain ack──► Draining ──seal ack──► Sealing
+                                                                       │
+                                                                  seal OK
+                                                                       │
+                                                                       ▼
+                                                    ResumingAfterAbort ◄── AwaitingReady
+                                                           ▲                     │
+                                                           │                 Ready recv
+                                                           │                     │
+                                                     Aborting ◄── N timeout      ▼
+                                                                            Committed
+```
+
+| From | Event | To | What S Actually Does |
+|------|-------|----|---------------------|
+| `Idle` | `perform_handoff` called | `Negotiating` | Connects to O, spawns N, Hello/HelloAck with both |
+| `Negotiating` | `Drained` recv | `Draining` | Sends `SealRequest` |
+| `Draining` | `SealComplete` recv | `Sealing` | Sends `Begin` to N |
+| `Sealing` | `SealFailed` recv | `Idle` | Kills N; returns `HandoffOutcome{committed:false}` |
+| `Sealing` | timeout | `Aborting` | Kills N; journal cleared |
+| `Sealing` | `Begin` sent | `AwaitingReady` | Waits for N's `Ready` |
+| `AwaitingReady` | `Ready` recv | `Committed` | Sends `Commit` to O; disarms `ChildGuard` |
+| `AwaitingReady` | timeout / N error | `ResumingAfterAbort` | Kills N; sends `ResumeAfterAbort` to O |
+| `Committed` | journal cleared | `Idle` | Returns `HandoffOutcome{committed:true, child:N}` |
+| `ResumingAfterAbort` | journal cleared | `Idle` | Returns `HandoffOutcome{committed:false}` |
+
+### Incumbent session state machine (O-side, per supervisor connection)
+
+```
+Idle ──HelloAck──► Active
+                      │
+              PrepareHandoff
+                      │
+                   Drained ──SealRequest──► Sealed ──Commit──► Committed (serve() returns Ok(()))
+                      │                        │
+                 Abort/EOF              Abort / ResumeAfterAbort / EOF
+                      │                        │
+               resume_after_abort       re-acquire flock + resume_after_abort
+                      │                        │
+                      └──────────► Idle (keep accepting)
+```
+
+| From | Message | To | What O Actually Does |
+|------|---------|-----|---------------------|
+| `Active` | `PrepareHandoff` | `Drained` | Calls `drainable.drain(deadline)`; sends `Drained` |
+| `Drained` | `SealRequest` | `Sealed` | Calls `drainable.seal()`; drops `DataDirLock`; sends `SealComplete` |
+| `Drained` | `SealRequest` (seal fails) | `Active` | Calls `resume_after_abort()`; sends `SealFailed`; resets `active=None` |
+| `Sealed` | `Commit` | — | Returns `SessionOutcome::Committed`; `serve()` returns `Ok(())` |
+| `Sealed` | `ResumeAfterAbort` | `Active` | Calls `resume_after_abort()`; re-acquires `DataDirLock` |
+| `Sealed` | EOF (S crash) | `Active` | Re-acquires `DataDirLock`; calls `resume_after_abort()` |
+| `Drained` | EOF (S crash) | `Active` | Calls `resume_after_abort()` (flock never released) |
+| Any | `Abort` | `Active` | Conditionally calls `resume_after_abort()` + re-acquire flock if sealed |
+
+## Why It Behaves This Way
+
+### Why O releases the flock before commit (not at exit)
+
+After `seal()`, O has no remaining writes. Its data is on disk. Holding the flock until `Commit` would prevent N from acquiring it and opening state, extending the window during which N can't accept new connections. Releasing immediately after seal is safe: O serves only in-flight reads from sealed (read-only) files for the remainder of its life.
+
+### Why listener FDs flow via env vars, not over the control socket
+
+Passing FDs over Unix sockets (`SCM_RIGHTS`) requires an established connection and correct `sendmsg`/`recvmsg` sequencing. The supervisor-to-child relationship is via `fork+exec` — using `pre_exec` + `dup2` into the target FD slots is simpler, more reliable (no timing dependency on the socket being writable), and matches the systemd socket activation convention that existing tooling (systemd, test harnesses) already understands.
+
+### Why the library has no async runtime dependency
+
+The control socket carries one peer at a time, at low throughput, during rare swap events. Synchronous `std::os::unix::net::UnixStream` I/O on a dedicated OS thread is sufficient. Pulling in tokio would force all consumers of the library to match its runtime version. Consumers bridge to their own runtime via channels (`std::sync::mpsc`) where `Drainable` methods need async behavior.
+
+### Why `ChildGuard` instead of manual cleanup
+
+`perform_handoff` has many early-return paths (network errors, timeouts, unexpected messages). Without a guard, each early return would need to kill + reap the spawned child. `ChildGuard` drops automatically on every path except the explicit `disarm()` on the commit path. See `supervisor.rs:ChildGuard`.
+
+### Why the state journal uses rename, not O_DSYNC write
+
+`write tmp + rename` produces an atomic view: the on-disk file is always either the old complete state or the new complete state, never a partial write. `O_DSYNC` only ensures the write itself is durable — it doesn't prevent a torn record if the supervisor crashes mid-write. Rename on Linux ext4/XFS/btrfs is atomic with respect to crash consistency.
+
+### Why heartbeats flow both directions, but only S uses them for timeout
+
+The 5-second heartbeat gap triggers peer-died detection in `read_until()`. Currently only the supervisor side times out based on heartbeats (via `set_read_timeout`). The incumbent echoes heartbeats to keep the S-side timer alive during long drain or seal operations. `SealProgress` frames also reset the timer on the S→O channel during multi-shard seals.
+
+## Trust Boundaries
+
+**What the library verifies:**
+
+- Successor's announced `pid` in `Hello` matches the PID returned by `Command::spawn()` — prevents a rogue process from connecting and posing as N.
+- Protocol version is within the negotiated range — rejects version mismatches before any handoff begins.
+- `handoff_id` in every message matches the active handoff — rejects replayed or cross-session messages.
+- Frame length is ≤ 1 MiB — prevents unbounded allocation from a malformed peer.
+- `Commit` is not accepted before `SealComplete` — protocol ordering is enforced.
+
+**What passes through unchecked:**
+
+- `build_id` in `Hello` — logged but not validated; no signature or hash check.
+- `healthz_ok` in `Ready` — S records it but does not abort if false; policy is left to the consumer.
+- `advertised_revision_per_shard` in `Ready` — S records it but does not compare against O's `SealComplete` revisions; cross-shard consistency is the consumer's responsibility.
+- The content of the data dir after seal — S does not verify the `data_dir_fingerprint` from `SealComplete`; N opens whatever state it finds.
+
+**Why these boundaries are where they are:**
+
+The library is embedded in a trusted, same-host supervisor process. All three roles (S, O, N) are spawned by the same operator; no external network is involved. Authentication between them is not needed — the Unix socket path is the security boundary. If an untrusted process can connect to the control socket, the host is already compromised.
+
+## Package Structure
+
+| File | What It Does |
+|------|-------------|
+| `crates/handoff/src/lib.rs` | Re-exports public surface; no logic |
+| `crates/handoff/src/protocol.rs` | Wire message enum + framing constants; `negotiate_version()` |
+| `crates/handoff/src/frame.rs` | `read_message` / `write_message`; 1 MiB frame cap |
+| `crates/handoff/src/supervisor.rs` | `Supervisor::perform_handoff()`; `ChildGuard`; journal writes; `spawn_successor()` pre_exec dance |
+| `crates/handoff/src/incumbent.rs` | `Incumbent::serve()`; per-session state machine; flock release on seal |
+| `crates/handoff/src/drainable.rs` | `Drainable` trait + report types (`DrainReport`, `SealReport`, `StateSnapshot`) |
+| `crates/handoff/src/role.rs` | `detect_role()`; `Successor` handshake API; `InheritedListeners` |
+| `crates/handoff/src/lock.rs` | `DataDirLock` RAII flock; `acquire_or_break_stale()` |
+| `crates/handoff/src/state.rs` | `StateJournal` + `Phase`; atomic write-rename persistence |
+| `crates/handoff/src/error.rs` | `Error` enum; `mpsc` channel conversions |
+| `crates/handoff/src/metrics.rs` | `tracing` event name constants and metric name constants |
+| `crates/handoff-supervisor/src/main.rs` | Reference supervisor binary: TOML config, cold-start spawn, Unix trigger socket (`handoff [binary]` command) |
+
+## Configuration
+
+### `handoff-supervisor` TOML config
+
+| Field | Default | What It Controls at Runtime |
+|-------|---------|----------------------------|
+| `control_socket` | (required) | Path where the incumbent's `Incumbent::bind()` listens; S connects here at handoff start |
+| `binary` | (required) | Default executable for primitive spawns; overridable per trigger command |
+| `args` | `[]` | Argv passed to every primitive spawn |
+| `env` | `[]` | Extra env vars merged into every spawn's environment |
+| `listeners` | `[]` | Sockets S binds at startup; inherited by every primitive via LISTEN_FDS |
+| `trigger_socket` | (required) | Unix socket S listens on for `handoff [binary]` trigger commands |
+| `journal` | `None` | If set, S writes phase journal here for crash recovery |
+| `drain_grace_secs` | `25` | Maximum seconds S waits for `Drained` after sending `PrepareHandoff` |
+| `deadline_secs` | `60` | Overall handoff deadline (post-drain through Ready) |
+
+### `SpawnSpec` (library API)
+
+| Field | Default | What It Controls at Runtime |
+|-------|---------|----------------------------|
+| `deadline` | `60s` | Overall timeout from PrepareHandoff to Ready; exceeded → N killed, O resumes |
+| `drain_grace` | `25s` | Timeout for `Drainable::drain()` to return; `+1s` wire buffer before timeout fires |
+
+## Failure Modes
+
+| Failure | What Actually Happens | Recovery |
+|---------|----------------------|----------|
+| N crashes before `Ready` | Socketpair EOF; `ChildGuard` kills + reaps N; S sends `ResumeAfterAbort` to O | O re-acquires flock, calls `resume_after_abort()`, keeps serving |
+| N doesn't send `Ready` before `deadline_ms` | `read_until` times out; S sends `Abort` to N, kills it; sends `ResumeAfterAbort` to O | Same as above |
+| O's `seal()` returns error | O sends `SealFailed`; O immediately calls `resume_after_abort()` (flock never released); S kills N | O stays incumbent; `HandoffOutcome{committed:false}` returned; retry is safe |
+| S crashes during handoff (any phase) | N exits on socketpair EOF; O observes EOF and self-recovers based on phase | If sealed: O re-acquires flock + resumes. If drained: O resumes. Journal cleared on S restart |
+| Concurrent `perform_handoff` calls | Second caller gets `Error::HandoffInProgress` immediately from `try_lock` | Caller serializes retries; no protocol message sent to O or N |
+| Second `PrepareHandoff` with different `handoff_id` | O returns `Error::HandoffInProgress`; session closes | S observes disconnect; must start fresh session |
+| Frame > 1 MiB received | `Error::FrameTooLarge`; connection closed | Peer has a bug; reconnect |
+| Protocol version mismatch | `Error::VersionMismatch`; connection closed before any handoff begins | Upgrade either S or the primitive |
+| Stale pidfile, holder dead | `acquire_or_break_stale()` detects dead PID via `kill(pid, 0)`; unlinks files; acquires on fresh inode | Automatic; no manual intervention |
+| Stale pidfile, holder alive | `Error::StaleLockBreakRefused` — refuses to evict a live process | Manual investigation required; indicates two supervisors for one data dir |
+
+## Observability
+
+The library emits `tracing` events at each phase transition and exposes metric name constants via `metrics.rs`. Consumers register counters/histograms with these names so dashboards stay consistent.
+
+| Metric Name | Type | What It Measures |
+|-------------|------|-----------------|
+| `handoff_handoffs_total` | counter | Total handoffs attempted |
+| `handoff_failures_total` | counter | Handoffs that returned an error |
+| `handoff_rolled_back_total` | counter | Handoffs aborted with resume (O kept serving) |
+| `handoff_seal_failures_total` | counter | `SealFailed` messages received |
+| `handoff_duration_seconds` | histogram | Wall time from PrepareHandoff to Commit |
+| `handoff_drain_seconds` | histogram | Wall time for `Drainable::drain()` |
+| `handoff_seal_seconds` | histogram | Wall time for `Drainable::seal()` |
+| `handoff_begin_to_ready_seconds` | histogram | Wall time from `Begin` sent to `Ready` received |
+
+| Tracing Event | Phase |
+|---------------|-------|
+| `handoff.prepare` | `PrepareHandoff` sent to O |
+| `handoff.drained` | `Drained` received from O |
+| `handoff.seal` | `SealRequest` sent to O |
+| `handoff.seal_complete` | `SealComplete` received, flock released |
+| `handoff.ready` | `Ready` received from N |
+| `handoff.commit` | `Commit` sent to O |
+| `handoff.abort` | `Abort` sent (either peer) |
+| `handoff.resume` | `ResumeAfterAbort` processed; O back to serving |
 
 ## Public API
 
 ```rust
+// Consumer implements this in their daemon.
 pub trait Drainable: Send + Sync {
     fn drain(&self, deadline: Instant) -> Result<DrainReport>;
     fn seal(&self) -> Result<SealReport>;
@@ -98,52 +373,76 @@ pub trait Drainable: Send + Sync {
     fn snapshot_state(&self) -> StateSnapshot;
 }
 
-pub fn detect_role() -> Role;          // ColdStart | Successor { ... }
+// In the primitive's startup sequence:
+pub fn detect_role() -> Result<Role>;     // Role::ColdStart | Role::Successor
 
-pub struct Successor { /* ... */ }
+pub struct Successor;
 impl Successor {
-    pub fn take_listener(&mut self, name: &str) -> Option<std::net::TcpListener>;
+    pub fn handshake(&mut self, build_id: Vec<u8>) -> Result<HandoffId>;
+    pub fn wait_for_begin(&mut self) -> Result<HandoffId>;
+    pub fn take_listener(&mut self, name: &str) -> Option<TcpListener>;
+    /// Send `Ready`. Caller must NOT bind the control socket until the
+    /// prior incumbent has exited (i.e. its `serve()` returned). Prefer
+    /// `announce_and_bind` unless you have a specific reason to delay bind.
     pub fn announce_ready(self, snapshot: ReadinessSnapshot) -> Result<()>;
+    /// Send `Ready` and bind the control socket as the new incumbent in
+    /// one call — the only safe ordering for the successor-side rebind.
+    pub fn announce_and_bind(
+        self,
+        snapshot: ReadinessSnapshot,
+        socket_path: &Path,
+        lock: DataDirLock,
+    ) -> Result<Incumbent>;
 }
 
-pub struct Incumbent { /* ... */ }
+pub struct Incumbent;
 impl Incumbent {
-    pub fn bind(socket_path: &Path, lock: DataDirLock) -> Result<Self>;
+    /// Cold-start bind. Unlinks any stale socket file before binding;
+    /// safe only when no prior incumbent is alive on this path. From a
+    /// successor, use `Successor::announce_and_bind` instead.
+    pub fn bind_cold_start(socket_path: &Path, lock: DataDirLock) -> Result<Self>;
+    pub fn with_build_id(self, build_id: Vec<u8>) -> Self;
     pub fn serve<D: Drainable + 'static>(self, drainable: D) -> Result<()>;
+    // serve() returns Ok(()) after Commit; call process::exit(0) after it returns.
 }
 
-pub struct DataDirLock { /* RAII flock guard */ }
+pub struct DataDirLock;
 impl DataDirLock {
     pub fn acquire(data_dir: &Path) -> Result<Self>;
     pub fn acquire_or_break_stale(data_dir: &Path) -> Result<Self>;
 }
 
+// In the supervisor process:
 pub mod supervisor {
-    pub struct Supervisor { /* ... */ }
+    pub struct Supervisor;
     impl Supervisor {
         pub fn new(socket_path: &Path) -> Result<Self>;
+        pub fn add_listener(&mut self, name: impl Into<String>, fd: RawFd) -> &mut Self;
+        pub fn with_journal(self, path: PathBuf) -> Self;
+        pub fn with_build_id(self, build_id: Vec<u8>) -> Self;
         pub fn perform_handoff(&self, spec: SpawnSpec) -> Result<HandoffOutcome>;
+        // Returns Error::HandoffInProgress immediately if another thread is inside.
+        pub fn resume_from_journal(&self) -> Result<Option<StateJournal>>;
+        // Call once at startup before the first perform_handoff.
     }
 }
 ```
 
-## Async runtime
+### Crash-injection points (test-only)
 
-The library has **no async runtime dependency**. The control socket carries one peer with low-throughput frames during rare swap events — sync `std::os::unix::net::UnixStream` I/O on a dedicated OS thread is sufficient.
+The `crash-points` cargo feature on the `handoff` crate makes named protocol
+boundaries injectable via the `HANDOFF_CRASH_AT` env var, terminating the
+process with `_exit(99)` on match. Production builds (the feature off) elide
+the calls entirely. See `crates/handoff-tests/` for the integration harness
+that uses these points to verify recovery from every documented crash
+scenario.
 
-The `Drainable` trait is sync; each consumer bridges to its own async runtime via a typed channel + oneshot reply. The `handoff-supervisor` reference binary uses tokio internally — that's a per-binary choice, not a library-wide one.
+## Correctness Invariants
 
-## Env-var contract
-
-A successor process is spawned by its supervisor with:
-
-| Variable          | Meaning                                                  |
-| ----------------- | -------------------------------------------------------- |
-| `HANDOFF_ROLE`    | `successor` (presence signals successor mode)            |
-| `HANDOFF_SOCK_FD` | FD number of the open control socket                     |
-| `LISTEN_FDS`      | Number of inherited listener FDs (always start at FD 3)  |
-| `LISTEN_FDNAMES`  | Colon-separated logical names matching the FDs in order  |
-
-`detect_role()` reads these. `Successor::take_listener(name)` returns the `TcpListener` for a named FD, then clears the env var so accidental double-take panics.
-
-A cold-start process (no `HANDOFF_ROLE` set) binds its own listeners as today.
+1. At most one process holds the flock at any time.
+2. Flock is released only after seal succeeds, or after a seal-failure that leaves no committed-but-orphaned state.
+3. No acked write is lost across a handoff — `Drainable::drain` must fsync before returning.
+4. The listener socket never closes from the kernel's perspective; the accept queue absorbs the gap between O's last accept and N's first accept.
+5. N refuses to write until it holds the flock.
+6. An aborted handoff returns the system to the pre-handoff observable state with no resource leaks.
+7. The protocol is resumable from any acknowledged state on supervisor restart (state journal at configurable path; default `/var/lib/beyond/handoff/<svc>/state.bin`).

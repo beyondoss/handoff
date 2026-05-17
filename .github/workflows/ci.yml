@@ -1,0 +1,59 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (crash-points enabled)
+        run: cargo clippy -p handoff --features crash-points --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + integration tests
+        run: cargo test --workspace --lib --tests
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  crash-matrix:
+    name: Crash matrix (fault injection)
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fixture binaries
+        # Build first so each scenario's spawn doesn't pay compilation cost.
+        run: cargo build -p handoff-tests --bins --tests
+      - name: Run crash matrix
+        env:
+          RUST_LOG: warn,handoff=info
+        # `--test-threads=1` because the fixture binaries do not honor a
+        # per-fixture log path (they share `RUST_LOG`); serializing keeps
+        # log output coherent on failure without slowing the suite — each
+        # scenario takes <100ms.
+        run: cargo test -p handoff-tests --test crash_matrix --test happy_path -- --test-threads=1 --nocapture

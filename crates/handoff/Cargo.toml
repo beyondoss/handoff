@@ -1,10 +1,21 @@
 [package]
-name = "handoff"
+name = "beyond-handoff"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Zero-downtime atomic binary handoff for long-running daemons"
+repository = "https://github.com/beyondoss/handoff"
+documentation = "https://docs.rs/beyond-handoff"
+readme = "../../README.md"
+keywords = ["zero-downtime", "handoff", "supervisor", "blue-green", "deploy"]
+categories = ["network-programming", "os::unix-apis"]
+
+# The published crate is `beyond-handoff`, but the library identifier stays
+# `handoff` — embedders write `use handoff::*` without the beyond- prefix.
+[lib]
+name = "handoff"
+path = "src/lib.rs"
 
 [dependencies]
 libc.workspace = true
@@ -14,6 +25,12 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[features]
+default = []
+# Enables `crash_here!` injection points at protocol boundaries. Used by the
+# `handoff-tests` crate's fixture binaries; off in production builds.
+crash-points = []
 
 [dev-dependencies]
 tempfile = "3"

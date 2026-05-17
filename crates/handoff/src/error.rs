@@ -19,8 +19,14 @@ pub enum Error {
     #[error("protocol violation: {0}")]
     Protocol(String),
 
-    #[error("frame too large or malformed: {0} bytes")]
+    #[error("frame too large: {0} bytes exceeds cap")]
     FrameTooLarge(u32),
+
+    #[error("frame malformed: declared length {0} is below the protocol minimum")]
+    FrameMalformed(u32),
+
+    #[error("peer announced pid {announced} does not match expected pid {expected}")]
+    PidMismatch { expected: u32, announced: u32 },
 
     #[error(
         "protocol version mismatch: our range {our_min}..={our_max}, peer range \
@@ -65,9 +71,6 @@ pub enum Error {
 
     #[error("internal channel disconnected")]
     Channel,
-
-    #[error("not yet implemented")]
-    Unimplemented,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

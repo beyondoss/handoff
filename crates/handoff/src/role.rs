@@ -90,7 +90,11 @@ pub struct Successor {
 /// listeners. Env vars are removed so re-entry yields a clean state.
 pub fn detect_role() -> Result<Role> {
     let inherited = read_inherited_listeners();
-    // Remove listener env vars regardless of role.
+    // SAFETY: `env::remove_var` races with concurrent env reads on other
+    // threads (`std::env::set_var` / `getenv` from libc). `detect_role` is
+    // contracted to run during single-threaded startup before the primitive
+    // spawns its serving threads — see the module docstring. Callers that
+    // violate that contract are responsible for the data race.
     unsafe {
         env::remove_var(ENV_LISTEN_FDS);
         env::remove_var(ENV_LISTEN_FDNAMES);
@@ -108,7 +112,9 @@ pub fn detect_role() -> Result<Role> {
         value: sock_raw,
     })?;
 
-    // Consume successor-only env vars so a re-entry takes the ColdStart branch.
+    // SAFETY: same single-threaded-startup invariant as the listener env
+    // removal above; clearing these vars makes a re-entry take the
+    // ColdStart branch instead of trying to re-attach to a consumed FD.
     unsafe {
         env::remove_var(ENV_HANDOFF_ROLE);
         env::remove_var(ENV_HANDOFF_SOCK_FD);
@@ -172,13 +178,31 @@ impl Successor {
         }
     }
 
-    /// Block until the supervisor sends `Begin`. Returns the handoff id (must
-    /// match the one from `handshake`).
+    /// Block until the supervisor sends `Begin`. The Begin's handoff_id must
+    /// match the one negotiated in `handshake`; if it doesn't, returns
+    /// `Error::Protocol`. Heartbeats from the supervisor are skipped silently.
     pub fn wait_for_begin(&mut self) -> Result<HandoffId> {
-        let (_ver, msg) = read_message(&mut self.control)?;
-        match msg {
-            Message::Begin { handoff_id } => Ok(handoff_id),
-            other => Err(Error::UnexpectedMessage(message_name(&other))),
+        loop {
+            let (_ver, msg) = read_message(&mut self.control)?;
+            match msg {
+                Message::Begin { handoff_id } => {
+                    // The supervisor is the same process that assigned our
+                    // handshake id; any mismatch is a protocol bug, not a
+                    // recoverable condition. Surface it so the successor
+                    // exits before it touches the data directory.
+                    match self.handoff_id {
+                        Some(expected) if expected != handoff_id => {
+                            return Err(Error::Protocol(format!(
+                                "Begin handoff_id {handoff_id} does not match \
+                                 handshake id {expected}"
+                            )));
+                        }
+                        _ => return Ok(handoff_id),
+                    }
+                }
+                Message::Heartbeat { .. } => continue,
+                other => return Err(Error::UnexpectedMessage(message_name(&other))),
+            }
         }
     }
 
@@ -195,6 +219,21 @@ impl Successor {
 
     /// Send `Ready`. Consumes self because once the supervisor knows we're
     /// ready, the main serving loop takes over and this object's job is done.
+    ///
+    /// # Caveat: don't bind the control socket immediately after this
+    ///
+    /// After `Ready` is sent there is a brief window during which the
+    /// supervisor still has to deliver `Commit` to the prior incumbent and
+    /// that incumbent still has to exit. During that window the prior
+    /// incumbent is the authoritative owner of the control-socket path;
+    /// rebinding from the successor here would unlink its path-binding and
+    /// break the abort path if the successor then crashes.
+    ///
+    /// Prefer [`announce_and_bind`](Self::announce_and_bind) — it combines
+    /// `Ready` + bind into one call and is the only path that orders them
+    /// correctly by construction. Use this lower-level entry point only
+    /// when you genuinely need to delay binding (e.g. for additional
+    /// post-`Ready` setup that does not require the control socket).
     pub fn announce_ready(mut self, snapshot: ReadinessSnapshot) -> Result<()> {
         let handoff_id = self
             .handoff_id
@@ -208,6 +247,24 @@ impl Successor {
         };
         write_message(&mut self.control, ver, &ready)?;
         Ok(())
+    }
+
+    /// Send `Ready` to the supervisor, then bind this process as the new
+    /// incumbent on `socket_path`. The two operations are combined to
+    /// enforce ordering: by the time the bind runs, the supervisor has
+    /// observed `Ready` and is about to (or has just) committed the prior
+    /// incumbent, so the path-binding takeover is safe.
+    ///
+    /// This is the safe path for successor processes; cold-start callers
+    /// use [`crate::Incumbent::bind_cold_start`] directly.
+    pub fn announce_and_bind(
+        self,
+        snapshot: ReadinessSnapshot,
+        socket_path: &std::path::Path,
+        lock: crate::DataDirLock,
+    ) -> Result<crate::Incumbent> {
+        self.announce_ready(snapshot)?;
+        crate::Incumbent::bind_cold_start(socket_path, lock)
     }
 
     /// Negotiated handoff id (after `handshake`).
@@ -243,7 +300,10 @@ mod tests {
     // one function to avoid races with the cargo test thread pool.
     #[test]
     fn detect_env_branches() {
-        // Clean env first; some other test or the user shell may have set them.
+        // SAFETY: env mutation is process-global and unsafe under
+        // concurrent reads. This whole test runs as a single function on
+        // one thread; no other code in the test process touches these
+        // handoff-specific vars, so there is no concurrent reader to race.
         unsafe {
             env::remove_var(ENV_HANDOFF_ROLE);
             env::remove_var(ENV_HANDOFF_SOCK_FD);
@@ -252,10 +312,12 @@ mod tests {
         }
         assert!(matches!(detect_role().unwrap(), Role::ColdStart { .. }));
 
+        // SAFETY: same single-threaded-test invariant as above.
         unsafe {
             env::set_var(ENV_HANDOFF_ROLE, "other");
         }
         assert!(matches!(detect_role().unwrap(), Role::ColdStart { .. }));
+        // SAFETY: same single-threaded-test invariant as above.
         unsafe {
             env::remove_var(ENV_HANDOFF_ROLE);
         }

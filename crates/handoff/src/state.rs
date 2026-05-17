@@ -15,16 +15,25 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::protocol::HandoffId;
 
+/// Coarse phase recorded in the on-disk journal between protocol steps. Used
+/// by the supervisor for crash-recovery diagnostics — not the in-memory
+/// state machine. Each variant maps 1:1 to a transition documented in
+/// `ARCHITECTURE.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
-    Idle,
+    /// `Hello`/`HelloAck` exchanged with both peers; no protocol message
+    /// sent or received yet.
     Negotiating,
+    /// `Drained` received from O. Next supervisor action is `SealRequest`.
     Draining,
+    /// `SealComplete` received from O. O has released the flock. Next
+    /// supervisor action is `Begin` to N.
     Sealing,
-    Beginning,
+    /// `Begin` sent to N. Waiting for `Ready`.
     AwaitingReady,
+    /// `Commit` sent to O. Cleanup pending (journal clear, child disarm).
     Committed,
-    Aborting,
+    /// `ResumeAfterAbort` sent to O after a post-seal abort.
     ResumingAfterAbort,
 }
 

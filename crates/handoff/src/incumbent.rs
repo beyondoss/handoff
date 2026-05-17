@@ -16,10 +16,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::crash::points;
+use crate::crash_here;
 use crate::drainable::Drainable;
 use crate::error::{Error, Result};
 use crate::frame::{read_message, write_message};
 use crate::lock::DataDirLock;
+use crate::metrics::events;
 use crate::protocol::{
     Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, Side, negotiate_version,
 };
@@ -40,8 +43,37 @@ enum SessionOutcome {
     Closed,
 }
 
+/// Per-supervisor-session state. Lives entirely inside `handle_session`; the
+/// fields move together through `run_session_loop`, so grouping them keeps
+/// the invariants explicit (no `&mut bool` triplets passed across the call
+/// boundary).
+#[derive(Default)]
+struct SessionState {
+    active: Option<HandoffId>,
+    sealed: bool,
+    /// True once `drainable.drain` returned successfully for the current
+    /// `active` handoff. Used to decide whether the consumer needs a
+    /// `resume_after_abort` to restart accepting on any non-Commit exit.
+    drained: bool,
+}
+
 impl Incumbent {
-    pub fn bind(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
+    /// Bind the control socket for **cold-start** use only.
+    ///
+    /// "Cold start" means this process has no prior incumbent to displace —
+    /// either the very first startup, or a recovery after a crash where the
+    /// prior process is already gone. The bind unlinks any stale file at
+    /// `socket_path`, which is safe in those scenarios.
+    ///
+    /// # Do not call from a successor before `Ready`
+    ///
+    /// A successor process must NOT call this before
+    /// [`Successor::announce_ready`] returns — doing so unlinks the prior
+    /// incumbent's still-valid path-binding and breaks the supervisor's
+    /// abort path. From a successor, prefer
+    /// [`Successor::announce_and_bind`], which orders `Ready` and bind in
+    /// one call.
+    pub fn bind_cold_start(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -137,11 +169,35 @@ impl Incumbent {
             other => return Err(Error::UnexpectedMessage(short_name(&other))),
         };
 
-        let mut active: Option<HandoffId> = None;
-        let mut sealed = false;
+        let mut state = SessionState::default();
+        let outcome = self.run_session_loop(&mut stream, chosen, drainable, &mut state);
 
+        // Drain-without-commit cleanup. The consumer stopped accepting when we
+        // called `drain`; we need to tell them to start again before we leave
+        // the session.
+        let committed = matches!(outcome, Ok(SessionOutcome::Committed));
+        if state.drained
+            && !state.sealed
+            && !committed
+            && let Err(e) = drainable.resume_after_abort()
+        {
+            tracing::error!(
+                error = %e,
+                "resume_after_abort during drained-session cleanup failed"
+            );
+        }
+        outcome
+    }
+
+    fn run_session_loop<D: Drainable>(
+        &mut self,
+        stream: &mut UnixStream,
+        chosen: u16,
+        drainable: &D,
+        state: &mut SessionState,
+    ) -> Result<SessionOutcome> {
         loop {
-            let (_v, msg) = match read_message(&mut stream) {
+            let (_v, msg) = match read_message(stream) {
                 Ok(x) => x,
                 Err(Error::Io(e))
                     if matches!(
@@ -149,8 +205,10 @@ impl Incumbent {
                         ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
                     ) =>
                 {
-                    // Supervisor disconnected. If we sealed, we need to recover.
-                    if sealed {
+                    // Supervisor disconnected. If we sealed, surface as an
+                    // error so the serve() loop re-acquires the flock. If we
+                    // only drained, the outer cleanup will run resume.
+                    if state.sealed {
                         return Err(Error::Protocol(
                             "supervisor disconnected after seal; resuming".into(),
                         ));
@@ -167,39 +225,41 @@ impl Incumbent {
                     drain_grace_ms,
                     ..
                 } => {
-                    if let Some(existing) = active {
-                        if existing != handoff_id {
-                            return Err(Error::HandoffInProgress);
-                        }
+                    if let Some(existing) = state.active
+                        && existing != handoff_id
+                    {
+                        return Err(Error::HandoffInProgress);
                     }
-                    active = Some(handoff_id);
+                    state.active = Some(handoff_id);
                     let now = Instant::now();
                     let deadline = now + Duration::from_millis(drain_grace_ms.min(deadline_ms));
                     tracing::info!(
-                        target: crate::metrics::events::PREPARE,
+                        target: events::PREPARE,
                         %handoff_id, "drain start"
                     );
                     let report = drainable.drain(deadline)?;
+                    state.drained = true;
                     tracing::info!(
-                        target: crate::metrics::events::DRAINED,
+                        target: events::DRAINED,
                         %handoff_id, open_conns_remaining = report.open_conns_remaining,
                         "drain done"
                     );
                     write_message(
-                        &mut stream,
+                        stream,
                         chosen,
                         &Message::Drained {
                             open_conns_remaining: report.open_conns_remaining,
                             accept_closed: report.accept_closed,
                         },
                     )?;
+                    crash_here!(points::O_AFTER_DRAINED_SENT);
                 }
                 Message::SealRequest { handoff_id } => {
-                    if active != Some(handoff_id) {
+                    if state.active != Some(handoff_id) {
                         return Err(Error::UnexpectedMessage("SealRequest for unknown id"));
                     }
                     tracing::info!(
-                        target: crate::metrics::events::SEAL,
+                        target: events::SEAL,
                         %handoff_id, "seal start"
                     );
                     match drainable.seal() {
@@ -207,13 +267,14 @@ impl Incumbent {
                             // Release the flock immediately on seal success — N
                             // will acquire it. We continue serving reads until Commit.
                             self.lock.take();
-                            sealed = true;
+                            state.sealed = true;
+                            crash_here!(points::O_AFTER_SEAL_FLOCK_RELEASED);
                             tracing::info!(
-                                target: crate::metrics::events::SEAL_COMPLETE,
+                                target: events::SEAL_COMPLETE,
                                 %handoff_id, "seal complete; flock released"
                             );
                             write_message(
-                                &mut stream,
+                                stream,
                                 chosen,
                                 &Message::SealComplete {
                                     handoff_id,
@@ -221,13 +282,14 @@ impl Incumbent {
                                     data_dir_fingerprint: report.data_dir_fingerprint,
                                 },
                             )?;
+                            crash_here!(points::O_AFTER_SEAL_COMPLETE_SENT);
                         }
                         Err(e) => {
                             tracing::error!(
                                 %handoff_id, error = %e, "seal failed; remaining as incumbent"
                             );
                             write_message(
-                                &mut stream,
+                                stream,
                                 chosen,
                                 &Message::SealFailed {
                                     handoff_id,
@@ -235,61 +297,78 @@ impl Incumbent {
                                     partial_state: String::new(),
                                 },
                             )?;
-                            // Lock still held; supervisor will Abort N. We can
-                            // safely accept a future PrepareHandoff.
-                            active = None;
+                            // Lock still held; restart the consumer's accept
+                            // loop so it can serve while we wait for a retry.
+                            drainable.resume_after_abort()?;
+                            state.drained = false;
+                            state.active = None;
                         }
                     }
                 }
                 Message::Commit { handoff_id } => {
-                    if active != Some(handoff_id) {
+                    if state.active != Some(handoff_id) {
                         return Err(Error::UnexpectedMessage("Commit for unknown id"));
                     }
-                    if !sealed {
+                    if !state.sealed {
                         return Err(Error::Protocol("Commit before SealComplete".into()));
                     }
                     tracing::info!(
-                        target: crate::metrics::events::COMMIT,
+                        target: events::COMMIT,
                         %handoff_id, "handoff committed"
                     );
+                    crash_here!(points::O_AFTER_COMMIT_RECV);
                     return Ok(SessionOutcome::Committed);
                 }
                 Message::ResumeAfterAbort { handoff_id } => {
-                    if active != Some(handoff_id) {
+                    if state.active != Some(handoff_id) {
                         return Err(Error::UnexpectedMessage("Resume for unknown id"));
                     }
-                    if sealed {
-                        drainable.resume_after_abort()?;
-                        // Re-acquire the flock — N is dead so it has been released.
+                    if state.sealed {
+                        // Re-acquire the flock first — N is dead so it has
+                        // been released. Doing acquire before resume means
+                        // that if acquire fails, the serve loop's recovery
+                        // path will invoke resume exactly once on retry
+                        // rather than producing a double-resume.
                         let lock = DataDirLock::acquire(&self.data_dir)?;
                         self.lock = Some(lock);
-                        sealed = false;
+                        drainable.resume_after_abort()?;
+                        state.sealed = false;
+                        state.drained = false;
                         tracing::info!(
-                            target: crate::metrics::events::RESUME,
+                            target: events::RESUME,
                             %handoff_id, "resumed after abort; flock re-acquired"
                         );
+                    } else if state.drained {
+                        drainable.resume_after_abort()?;
+                        state.drained = false;
                     }
-                    active = None;
+                    state.active = None;
                 }
                 Message::Abort { handoff_id, reason } => {
-                    if active != Some(handoff_id) {
+                    if state.active != Some(handoff_id) {
                         return Err(Error::UnexpectedMessage("Abort for unknown id"));
                     }
                     tracing::warn!(
-                        target: crate::metrics::events::ABORT,
+                        target: events::ABORT,
                         %handoff_id, reason, "handoff aborted"
                     );
-                    if sealed {
-                        drainable.resume_after_abort()?;
+                    if state.sealed {
+                        // Acquire first, then resume — see the matching
+                        // comment in the `ResumeAfterAbort` arm above.
                         let lock = DataDirLock::acquire(&self.data_dir)?;
                         self.lock = Some(lock);
-                        sealed = false;
+                        drainable.resume_after_abort()?;
+                        state.sealed = false;
+                        state.drained = false;
+                    } else if state.drained {
+                        drainable.resume_after_abort()?;
+                        state.drained = false;
                     }
-                    active = None;
+                    state.active = None;
                 }
                 Message::Heartbeat { .. } => {
                     write_message(
-                        &mut stream,
+                        stream,
                         chosen,
                         &Message::Heartbeat {
                             ts_ms: now_unix_ms(),

@@ -83,6 +83,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "beyond-handoff"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix",
+ "postcard",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,32 +272,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "handoff"
-version = "0.1.0"
-dependencies = [
- "libc",
- "nix",
- "postcard",
- "serde",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "handoff-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "beyond-handoff",
  "clap",
- "handoff",
  "libc",
  "serde",
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "handoff-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "beyond-handoff",
+ "libc",
+ "nix",
+ "postcard",
+ "serde",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

@@ -3,15 +3,13 @@
 
 mod common;
 
-use std::os::unix::net::UnixStream;
 use std::thread;
-use std::time::Duration;
 
 use handoff::frame::{read_message, write_message};
 use handoff::protocol::{HandoffId, Message, PROTO_MAX};
 use handoff::{DataDirLock, Incumbent};
 
-use common::MockDrainable;
+use common::{MockDrainable, connect_with_retry};
 
 #[test]
 fn full_sequence_commits_and_releases_flock() {
@@ -20,7 +18,7 @@ fn full_sequence_commits_and_releases_flock() {
     let data_dir = temp.path().join("data");
 
     let lock = DataDirLock::acquire(&data_dir).unwrap();
-    let incumbent = Incumbent::bind(&sock_path, lock).unwrap();
+    let incumbent = Incumbent::bind_cold_start(&sock_path, lock).unwrap();
 
     let drainable = MockDrainable::default();
     let state = drainable.state.clone();
@@ -94,17 +92,4 @@ fn full_sequence_commits_and_releases_flock() {
         result.err()
     );
     assert_eq!(state.lock().unwrap().resumed, 0, "should not have resumed");
-}
-
-fn connect_with_retry(path: &std::path::Path) -> UnixStream {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match UnixStream::connect(path) {
-            Ok(s) => return s,
-            Err(_) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("connect failed: {e}"),
-        }
-    }
 }

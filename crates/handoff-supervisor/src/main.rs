@@ -15,11 +15,12 @@
 //! `beyond-pg`) link `handoff` directly and integrate it with their own
 //! lifecycle, observability, and rollout policy machinery.
 
+#![deny(unsafe_code)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,7 @@ use clap::Parser;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+use handoff::arrange_inherited_fds_on_spawn;
 use handoff::supervisor::{SpawnSpec, Supervisor};
 
 #[derive(Parser, Debug)]
@@ -117,6 +119,19 @@ fn main() -> Result<()> {
     }
     let sup = Arc::new(sup);
 
+    // Clear any leftover handoff journal from a prior supervisor crash.
+    // The incumbent self-recovers on disconnect; we just need to verify it
+    // and drop the on-disk state so the next handoff starts clean.
+    match sup.resume_from_journal() {
+        Ok(Some(prior)) => tracing::warn!(
+            handoff_id = %prior.handoff_id,
+            phase = ?prior.phase,
+            "resumed from prior handoff journal"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "resume_from_journal failed; continuing"),
+    }
+
     // Prepare the trigger socket.
     let _ = std::fs::remove_file(&cfg.trigger_socket);
     if let Some(parent) = cfg.trigger_socket.parent() {
@@ -182,20 +197,31 @@ fn handle_trigger(
                 deadline: Duration::from_secs(cfg.deadline_secs),
                 drain_grace: Duration::from_secs(cfg.drain_grace_secs),
             };
-            let outcome = sup.perform_handoff(spec).context("perform_handoff")?;
-            if outcome.committed {
-                // The previous primitive should be exiting; reap it.
-                if let Ok(mut child) = current_child.lock() {
-                    let _ = child.wait();
-                    // We've lost the std::process::Child handle for the new
-                    // primitive (it was dropped inside perform_handoff). Stub
-                    // current_child with a no-op placeholder PID-tracking
-                    // approach is out of scope for v1 — see future work.
+            let mut outcome = sup.perform_handoff(spec).context("perform_handoff")?;
+            let handoff_id = outcome.handoff_id;
+            let committed = outcome.committed;
+            let abort_reason = outcome.abort_reason.clone();
+            if committed
+                && let Some(new_child) = outcome.child.take()
+                && let Ok(mut current) = current_child.lock()
+            {
+                let outgoing_pid = current.id();
+                match current.wait() {
+                    Ok(status) => tracing::info!(
+                        pid = outgoing_pid,
+                        status = ?status,
+                        "outgoing primitive exited"
+                    ),
+                    Err(e) => tracing::warn!(
+                        pid = outgoing_pid,
+                        error = %e,
+                        "failed to reap outgoing primitive"
+                    ),
                 }
+                *current = new_child;
             }
             Ok(format!(
-                "ok: handoff_id={} committed={} abort_reason={:?}",
-                outcome.handoff_id, outcome.committed, outcome.abort_reason
+                "ok: handoff_id={handoff_id} committed={committed} abort_reason={abort_reason:?}"
             ))
         }
         Some(other) => Ok(format!("err: unknown command '{other}'")),
@@ -221,23 +247,7 @@ fn spawn_primitive_cold_start(cfg: &Config, listener_fds: &[(String, RawFd)]) ->
         .stderr(Stdio::inherit());
 
     let sources: Vec<RawFd> = listener_fds.iter().map(|(_, f)| *f).collect();
-    // SAFETY: pre_exec runs in the forked child before execve; only
-    // async-signal-safe calls allowed.
-    unsafe {
-        cmd.pre_exec(move || {
-            for (i, src) in sources.iter().enumerate() {
-                let dst = 3 + i as RawFd;
-                if *src == dst {
-                    if libc::fcntl(*src, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                } else if libc::dup2(*src, dst) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
+    arrange_inherited_fds_on_spawn(&mut cmd, sources);
     let child = cmd.spawn().context("cold-start primitive spawn")?;
     Ok(child)
 }

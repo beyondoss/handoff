@@ -5,21 +5,33 @@
 //! tokio for the rest of its orchestration; primitive embedders (guest-agent,
 //! beyond-pg) can run `perform_handoff` from a worker thread.
 
+use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
+use crate::crash::points;
+use crate::crash_here;
 use crate::error::{Error, Result};
+use crate::fd::arrange_inherited_fds_on_spawn;
 use crate::frame::{read_message, write_message};
+use crate::metrics::events;
 use crate::protocol::{
     HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version,
 };
 use crate::state::{Phase, StateJournal};
+
+/// Floor for any phase read timeout. Reads shorter than this are likely a
+/// programming error (no time left to even receive one frame).
+const MIN_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// Extra slack on top of `drain_grace` for the wire to deliver the `Drained`
+/// frame after the consumer's drain returns.
+const DRAIN_WIRE_BUFFER: Duration = Duration::from_secs(1);
 
 /// One supervised primitive instance.
 pub struct Supervisor {
@@ -29,6 +41,10 @@ pub struct Supervisor {
     listener_fds: Vec<(String, RawFd)>,
     journal_path: Option<PathBuf>,
     build_id: Vec<u8>,
+    /// Serializes `perform_handoff` calls so two threads can't drive
+    /// overlapping handoffs against the same incumbent (correctness invariant:
+    /// at most one in-flight swap per primitive).
+    in_flight: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,11 +71,71 @@ impl Default for SpawnSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HandoffOutcome {
     pub handoff_id: HandoffId,
     pub committed: bool,
     pub abort_reason: Option<String>,
+    /// On a committed handoff, the `Child` for the new primitive (N). The
+    /// caller owns it from here — the supervisor relinquishes lifecycle
+    /// tracking. `None` on every non-committed outcome (the child was
+    /// killed and reaped before this struct was constructed).
+    pub child: Option<Child>,
+}
+
+/// Kills + reaps the wrapped child on drop unless `disarm()` was called.
+/// Ensures we don't leak a spawned successor if `perform_handoff` returns
+/// via an early `?` after the spawn. The pid is cached at construction so
+/// [`ChildGuard::id`] never panics — it remains readable after the inner
+/// `Child` has been taken by `disarm` or the drop path.
+struct ChildGuard {
+    child: Option<Child>,
+    pid: u32,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.pid
+    }
+
+    /// Take the child without killing it. Used on the commit path: the new
+    /// primitive is now legitimately running and we hand it to the caller.
+    fn disarm(mut self) -> Child {
+        // `new` always populates `child` and `disarm` consumes `self` by
+        // value, so this take cannot observe `None`. Treat as an invariant.
+        self.child
+            .take()
+            .expect("BUG: ChildGuard inner Child missing — constructor invariant violated")
+    }
+
+    /// Kill + reap explicitly so the caller can log the result.
+    fn kill_and_reap(mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            tracing::warn!(
+                pid = self.pid,
+                "killing leaked successor child on guard drop"
+            );
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 impl Supervisor {
@@ -69,6 +145,7 @@ impl Supervisor {
             listener_fds: Vec::new(),
             journal_path: None,
             build_id: Vec::new(),
+            in_flight: Mutex::new(()),
         })
     }
 
@@ -91,33 +168,62 @@ impl Supervisor {
     }
 
     pub fn perform_handoff(&self, spec: SpawnSpec) -> Result<HandoffOutcome> {
+        let _in_flight = self
+            .in_flight
+            .try_lock()
+            .map_err(|_| Error::HandoffInProgress)?;
+
         let handoff_id = HandoffId::new();
-        let started = now_unix_ms();
+        let started_instant = Instant::now();
+        let started_unix_ms = now_unix_ms();
+        let total_deadline_at = started_instant + spec.deadline;
 
         // 1. Connect to O.
         let mut o_stream = UnixStream::connect(&self.socket_path)?;
         let chosen_o =
-            self.exchange_hello_as_supervisor(&mut o_stream, handoff_id, Side::Incumbent)?;
+            self.exchange_hello_as_supervisor(&mut o_stream, handoff_id, Side::Incumbent, None)?;
+        crash_here!(points::S_AFTER_O_HELLO);
 
         // 2. Create a socketpair for N's control channel.
         let (s_end, n_end) = make_socketpair()?;
         let n_end_raw = n_end.as_raw_fd();
 
         // 3. Spawn N. We keep s_end; n_end becomes the child's HANDOFF_SOCK_FD.
-        let mut child = self.spawn_successor(&spec, n_end_raw)?;
-        let successor_pid = child.id();
+        let child = self.spawn_successor(&spec, n_end_raw)?;
+        let child_guard = ChildGuard::new(child);
+        let successor_pid = child_guard.id();
         // Drop our parent-side copy of n_end now that the child has its own
         // duplicate. The kernel keeps the socket alive via the child's FD.
         drop(n_end);
+        crash_here!(points::S_AFTER_SPAWN_SUCCESSOR);
 
         let mut n_stream = s_end;
-        // 4. Hello/HelloAck with N.
-        let chosen_n =
-            self.exchange_hello_as_supervisor(&mut n_stream, handoff_id, Side::Successor)?;
+        // 4. Hello/HelloAck with N. Verify the child's announced PID matches
+        // the one we spawned.
+        let chosen_n = self.exchange_hello_as_supervisor(
+            &mut n_stream,
+            handoff_id,
+            Side::Successor,
+            Some(successor_pid),
+        )?;
+        crash_here!(points::S_AFTER_N_HELLO);
 
-        self.journal_set(handoff_id, Phase::Negotiating, successor_pid, started)?;
+        self.journal_set(
+            handoff_id,
+            Phase::Negotiating,
+            successor_pid,
+            started_unix_ms,
+        )?;
 
         // 5. PrepareHandoff → Drained.
+        let prepare_at = Instant::now();
+        tracing::info!(
+            target: events::PREPARE,
+            %handoff_id, successor_pid,
+            drain_grace_ms = spec.drain_grace.as_millis() as u64,
+            deadline_ms = spec.deadline.as_millis() as u64,
+            "prepare handoff"
+        );
         write_message(
             &mut o_stream,
             chosen_o,
@@ -128,82 +234,177 @@ impl Supervisor {
                 drain_grace_ms: spec.drain_grace.as_millis() as u64,
             },
         )?;
-        expect_message(&mut o_stream, "Drained", |m| {
+        crash_here!(points::S_AFTER_PREPARE_SENT);
+        let drain_timeout = spec.drain_grace + DRAIN_WIRE_BUFFER;
+        let drained_msg = read_until(&mut o_stream, drain_timeout, |m| {
             matches!(m, Message::Drained { .. })
         })?;
-        self.journal_set(handoff_id, Phase::Draining, successor_pid, started)?;
+        let (drained_open_conns, drained_accept_closed) = match &drained_msg {
+            Message::Drained {
+                open_conns_remaining,
+                accept_closed,
+            } => (*open_conns_remaining, *accept_closed),
+            _ => unreachable!("read_until predicate restricts variant"),
+        };
+        tracing::info!(
+            target: events::DRAINED,
+            %handoff_id,
+            open_conns_remaining = drained_open_conns,
+            accept_closed = drained_accept_closed,
+            drain_seconds = prepare_at.elapsed().as_secs_f64(),
+            "drain complete"
+        );
+        crash_here!(points::S_AFTER_DRAINED_RECV);
+        self.journal_set(handoff_id, Phase::Draining, successor_pid, started_unix_ms)?;
 
         // 6. SealRequest → SealComplete (or SealFailed).
+        let seal_at = Instant::now();
+        tracing::info!(target: events::SEAL, %handoff_id, "seal request");
         write_message(
             &mut o_stream,
             chosen_o,
             &Message::SealRequest { handoff_id },
         )?;
-        let sealed = loop {
-            let (_v, msg) = read_message(&mut o_stream)?;
-            match msg {
-                Message::SealProgress { .. } => continue,
-                Message::SealComplete { handoff_id: id, .. } if id == handoff_id => break true,
-                Message::SealFailed {
-                    handoff_id: id,
-                    error,
-                    ..
-                } if id == handoff_id => {
-                    // O retains its writer state. Abort N and report failure.
+        crash_here!(points::S_AFTER_SEAL_REQUEST_SENT);
+        let seal_timeout = remaining_until(total_deadline_at);
+        o_stream.set_read_timeout(Some(seal_timeout))?;
+        let seal_outcome: std::result::Result<(), String> = loop {
+            match read_message(&mut o_stream) {
+                Ok((_, Message::SealProgress { .. })) => continue,
+                Ok((_, Message::Heartbeat { .. })) => continue,
+                Ok((_, Message::SealComplete { handoff_id: id, .. })) if id == handoff_id => {
+                    break Ok(());
+                }
+                Ok((
+                    _,
+                    Message::SealFailed {
+                        handoff_id: id,
+                        error,
+                        ..
+                    },
+                )) if id == handoff_id => break Err(error),
+                Ok((_, other)) => {
+                    let _ = o_stream.set_read_timeout(None);
+                    return Err(Error::UnexpectedMessage(short_name(&other)));
+                }
+                Err(Error::Io(e)) if is_timeout(&e) => {
+                    let _ = o_stream.set_read_timeout(None);
                     let _ = write_message(
                         &mut n_stream,
                         chosen_n,
                         &Message::Abort {
                             handoff_id,
-                            reason: format!("seal failed: {error}"),
+                            reason: "seal phase timed out".into(),
                         },
                     );
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child_guard.kill_and_reap();
                     self.journal_clear();
-                    return Ok(HandoffOutcome {
-                        handoff_id,
-                        committed: false,
-                        abort_reason: Some(format!("seal failed: {error}")),
-                    });
+                    return Err(Error::Timeout("SealComplete"));
                 }
-                other => {
-                    return Err(Error::UnexpectedMessage(short_name(&other)));
+                Err(e) => {
+                    let _ = o_stream.set_read_timeout(None);
+                    return Err(e);
                 }
             }
         };
-        if !sealed {
-            // unreachable per the loop above but the compiler doesn't know.
-            return Err(Error::Protocol("seal loop terminated unexpectedly".into()));
+        let _ = o_stream.set_read_timeout(None);
+
+        if let Err(error) = seal_outcome {
+            // O retains its writer state. Abort N and report failure.
+            tracing::warn!(
+                target: events::ABORT,
+                %handoff_id, error = %error, "seal failed; aborting handoff"
+            );
+            let _ = write_message(
+                &mut n_stream,
+                chosen_n,
+                &Message::Abort {
+                    handoff_id,
+                    reason: format!("seal failed: {error}"),
+                },
+            );
+            child_guard.kill_and_reap();
+            self.journal_clear();
+            return Ok(HandoffOutcome {
+                handoff_id,
+                committed: false,
+                abort_reason: Some(format!("seal failed: {error}")),
+                child: None,
+            });
         }
-        self.journal_set(handoff_id, Phase::Sealing, successor_pid, started)?;
+        tracing::info!(
+            target: events::SEAL_COMPLETE,
+            %handoff_id,
+            seal_seconds = seal_at.elapsed().as_secs_f64(),
+            "seal complete; flock released by O"
+        );
+        crash_here!(points::S_AFTER_SEAL_COMPLETE_RECV);
+        self.journal_set(handoff_id, Phase::Sealing, successor_pid, started_unix_ms)?;
 
         // 7. Begin → Ready (deadline-bounded).
+        let begin_at = Instant::now();
         write_message(&mut n_stream, chosen_n, &Message::Begin { handoff_id })?;
-        self.journal_set(handoff_id, Phase::AwaitingReady, successor_pid, started)?;
+        crash_here!(points::S_AFTER_BEGIN_SENT);
+        self.journal_set(
+            handoff_id,
+            Phase::AwaitingReady,
+            successor_pid,
+            started_unix_ms,
+        )?;
 
-        n_stream.set_read_timeout(Some(spec.deadline))?;
-        let ready_result = read_message(&mut n_stream);
-        let _ = n_stream.set_read_timeout(None);
+        let ready_timeout = remaining_until(total_deadline_at);
+        let ready_result = read_until(&mut n_stream, ready_timeout, |m| {
+            matches!(m, Message::Ready { .. })
+        });
 
         match ready_result {
-            Ok((_v, Message::Ready { handoff_id: id, .. })) if id == handoff_id => {
+            Ok(Message::Ready {
+                handoff_id: id,
+                listening_on,
+                healthz_ok,
+                advertised_revision_per_shard,
+            }) if id == handoff_id => {
+                tracing::info!(
+                    target: events::READY,
+                    %handoff_id,
+                    healthz_ok,
+                    listeners = ?listening_on,
+                    advertised_revisions = ?advertised_revision_per_shard,
+                    begin_to_ready_seconds = begin_at.elapsed().as_secs_f64(),
+                    "successor ready"
+                );
+                crash_here!(points::S_AFTER_READY_RECV);
                 // 8. Commit O.
+                tracing::info!(
+                    target: events::COMMIT,
+                    %handoff_id,
+                    total_seconds = started_instant.elapsed().as_secs_f64(),
+                    "commit"
+                );
                 write_message(&mut o_stream, chosen_o, &Message::Commit { handoff_id })?;
-                self.journal_set(handoff_id, Phase::Committed, successor_pid, started)?;
+                crash_here!(points::S_AFTER_COMMIT_SENT);
+                self.journal_set(handoff_id, Phase::Committed, successor_pid, started_unix_ms)?;
                 self.journal_clear();
+                crash_here!(points::S_AFTER_JOURNAL_CLEAR);
+                // N is now the legitimate writer — hand its Child out to caller.
+                let child = child_guard.disarm();
                 Ok(HandoffOutcome {
                     handoff_id,
                     committed: true,
                     abort_reason: None,
+                    child: Some(child),
                 })
             }
             other => {
                 let reason = match &other {
-                    Ok((_, m)) => format!("expected Ready, got {}", short_name(m)),
-                    Err(Error::Io(e)) => format!("ready read failed: {e}"),
+                    Ok(m) => format!("expected Ready, got {}", short_name(m)),
+                    Err(Error::Timeout(s)) => format!("ready phase timed out waiting for {s}"),
                     Err(e) => format!("ready read failed: {e}"),
                 };
+                tracing::warn!(
+                    target: events::ABORT,
+                    %handoff_id, reason, "aborting handoff before commit"
+                );
                 // Abort N, resume O.
                 let _ = write_message(
                     &mut n_stream,
@@ -213,45 +414,92 @@ impl Supervisor {
                         reason: reason.clone(),
                     },
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child_guard.kill_and_reap();
                 write_message(
                     &mut o_stream,
                     chosen_o,
                     &Message::ResumeAfterAbort { handoff_id },
                 )?;
+                tracing::info!(
+                    target: events::RESUME,
+                    %handoff_id, "sent ResumeAfterAbort to O"
+                );
                 self.journal_set(
                     handoff_id,
                     Phase::ResumingAfterAbort,
                     successor_pid,
-                    started,
+                    started_unix_ms,
                 )?;
                 self.journal_clear();
                 Ok(HandoffOutcome {
                     handoff_id,
                     committed: false,
                     abort_reason: Some(reason),
+                    child: None,
                 })
             }
         }
     }
 
+    /// Read any persisted in-flight handoff state and clear it. Call once
+    /// before the first `perform_handoff` after a supervisor restart.
+    ///
+    /// The current incumbent auto-recovers from disconnect (sealed → re-acquire
+    /// flock + resume; drained → resume), so the supervisor's restart-time
+    /// responsibility is bounded: confirm the incumbent is reachable and
+    /// clear the journal. Returns the persisted state (for logging) or `None`
+    /// if no journal exists.
+    pub fn resume_from_journal(&self) -> Result<Option<StateJournal>> {
+        let Some(path) = self.journal_path.as_deref() else {
+            return Ok(None);
+        };
+        let Some(journal) = StateJournal::read(path)? else {
+            return Ok(None);
+        };
+        tracing::warn!(
+            handoff_id = %journal.handoff_id,
+            phase = ?journal.phase,
+            "found prior handoff state on disk; verifying incumbent then clearing"
+        );
+
+        // Best-effort liveness probe of the incumbent. The incumbent runs its
+        // own EOF-disconnect recovery, so this just confirms we can reach it.
+        match UnixStream::connect(&self.socket_path) {
+            Ok(mut stream) => {
+                // Drain the incumbent's Hello frame so the new session is
+                // clean; then drop the connection — incumbent observes EOF
+                // and its session-close path runs.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = read_message(&mut stream);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "incumbent unreachable during journal resume");
+            }
+        }
+
+        StateJournal::delete(path)?;
+        Ok(Some(journal))
+    }
+
     /// Run the Hello/HelloAck exchange where we are the supervisor: receive
-    /// the peer's Hello, send a HelloAck with our chosen version.
+    /// the peer's Hello, send a HelloAck with our chosen version. If
+    /// `expected_pid` is set, the peer's announced pid must match.
     fn exchange_hello_as_supervisor(
         &self,
         stream: &mut UnixStream,
         handoff_id: HandoffId,
         expected_role: Side,
+        expected_pid: Option<u32>,
     ) -> Result<ProtoVersion> {
         let (_v, peer_hello) = read_message(stream)?;
-        let (their_role, their_min, their_max) = match peer_hello {
+        let (their_role, their_pid, their_min, their_max) = match peer_hello {
             Message::Hello {
                 role,
+                pid,
                 proto_min,
                 proto_max,
                 ..
-            } => (role, proto_min, proto_max),
+            } => (role, pid, proto_min, proto_max),
             other => return Err(Error::UnexpectedMessage(short_name(&other))),
         };
         if their_role != expected_role {
@@ -259,6 +507,14 @@ impl Supervisor {
                 "peer announced role {:?}, expected {:?}",
                 their_role, expected_role
             )));
+        }
+        if let Some(expected) = expected_pid
+            && their_pid != expected
+        {
+            return Err(Error::PidMismatch {
+                expected,
+                announced: their_pid,
+            });
         }
         let chosen = negotiate_version(PROTO_MIN, PROTO_MAX, their_min, their_max)?;
         write_message(
@@ -293,28 +549,7 @@ impl Supervisor {
         // Source FDs in target-order: listeners first (3, 4, ...), then control sock.
         let mut sources: Vec<RawFd> = self.listener_fds.iter().map(|(_, f)| *f).collect();
         sources.push(n_sock_fd);
-
-        // SAFETY: `pre_exec` runs in the child after fork(2), before execve(2).
-        // We use only async-signal-safe operations (dup2, fcntl) — no
-        // allocations, no Rust locks.
-        unsafe {
-            cmd.pre_exec(move || {
-                for (i, src) in sources.iter().enumerate() {
-                    let dst = 3 + i as RawFd;
-                    if *src == dst {
-                        // Already in position: explicitly clear CLOEXEC so the
-                        // fd survives the upcoming execve.
-                        if libc::fcntl(*src, libc::F_SETFD, 0) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    } else if libc::dup2(*src, dst) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                        // Note: dup2 result always has CLOEXEC=false, no further work.
-                    }
-                }
-                Ok(())
-            });
-        }
+        arrange_inherited_fds_on_spawn(&mut cmd, sources);
 
         let child = cmd.spawn()?;
         Ok(child)
@@ -341,8 +576,14 @@ impl Supervisor {
     }
 
     fn journal_clear(&self) {
-        if let Some(path) = &self.journal_path {
-            let _ = StateJournal::delete(path);
+        if let Some(path) = &self.journal_path
+            && let Err(e) = StateJournal::delete(path)
+        {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to clear handoff journal; next supervisor start will see stale state"
+            );
         }
     }
 }
@@ -366,17 +607,50 @@ fn make_socketpair() -> Result<(UnixStream, UnixStream)> {
     Ok((s_a, s_b))
 }
 
-fn expect_message<F: FnOnce(&Message) -> bool>(
-    stream: &mut UnixStream,
-    name: &'static str,
-    pred: F,
-) -> Result<Message> {
-    let (_v, msg) = read_message(stream)?;
-    if pred(&msg) {
-        Ok(msg)
-    } else {
-        Err(Error::UnexpectedMessage(name))
+/// Read messages from `stream` until `pred` matches, ignoring incoming
+/// `Heartbeat`s. Bounded by `timeout` (clamped to at least `MIN_READ_TIMEOUT`).
+fn read_until<F>(stream: &mut UnixStream, timeout: Duration, pred: F) -> Result<Message>
+where
+    F: Fn(&Message) -> bool,
+{
+    let deadline = Instant::now() + timeout.max(MIN_READ_TIMEOUT);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(MIN_READ_TIMEOUT)
+            .max(MIN_READ_TIMEOUT);
+        stream.set_read_timeout(Some(remaining))?;
+        match read_message(stream) {
+            Ok((_, Message::Heartbeat { .. })) => continue,
+            Ok((_, msg)) if pred(&msg) => {
+                stream.set_read_timeout(None)?;
+                return Ok(msg);
+            }
+            Ok((_, other)) => {
+                let _ = stream.set_read_timeout(None);
+                return Err(Error::UnexpectedMessage(short_name(&other)));
+            }
+            Err(Error::Io(e)) if is_timeout(&e) => {
+                let _ = stream.set_read_timeout(None);
+                return Err(Error::Timeout("expected message"));
+            }
+            Err(e) => {
+                let _ = stream.set_read_timeout(None);
+                return Err(e);
+            }
+        }
     }
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(MIN_READ_TIMEOUT)
+        .max(MIN_READ_TIMEOUT)
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn now_unix_ms() -> u64 {

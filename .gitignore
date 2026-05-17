@@ -6,3 +6,4 @@ target/
 .claude/settings.local.json
 .claude
 .mcp.json
+.wiki/
