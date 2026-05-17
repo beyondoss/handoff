@@ -57,10 +57,7 @@ pub enum Error {
     #[error("seal failed: {0}")]
     SealFailed(String),
 
-    #[error("successor did not announce Ready before deadline")]
-    ReadyTimeout,
-
-    #[error("handoff aborted: {0}")]
+    #[error("handoff aborted by peer: {0}")]
     Aborted(String),
 
     #[error("required env var {0} not set")]

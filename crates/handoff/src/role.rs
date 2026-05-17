@@ -180,26 +180,33 @@ impl Successor {
 
     /// Block until the supervisor sends `Begin`. The Begin's handoff_id must
     /// match the one negotiated in `handshake`; if it doesn't, returns
-    /// `Error::Protocol`. Heartbeats from the supervisor are skipped silently.
+    /// `Error::Protocol`. If the supervisor sends `Abort` instead, returns
+    /// `Error::Aborted(reason)` so the caller can exit cleanly with the
+    /// reason on stderr instead of the opaque "UnexpectedMessage". Heartbeats
+    /// from the supervisor are skipped silently. Must be called after
+    /// [`handshake`](Self::handshake); calling it earlier returns
+    /// `Error::Protocol`.
     pub fn wait_for_begin(&mut self) -> Result<HandoffId> {
+        let expected = self.handoff_id.ok_or_else(|| {
+            Error::Protocol("wait_for_begin called before handshake".into())
+        })?;
         loop {
             let (_ver, msg) = read_message(&mut self.control)?;
             match msg {
+                Message::Begin { handoff_id } if handoff_id == expected => {
+                    return Ok(handoff_id);
+                }
                 Message::Begin { handoff_id } => {
                     // The supervisor is the same process that assigned our
                     // handshake id; any mismatch is a protocol bug, not a
                     // recoverable condition. Surface it so the successor
                     // exits before it touches the data directory.
-                    match self.handoff_id {
-                        Some(expected) if expected != handoff_id => {
-                            return Err(Error::Protocol(format!(
-                                "Begin handoff_id {handoff_id} does not match \
-                                 handshake id {expected}"
-                            )));
-                        }
-                        _ => return Ok(handoff_id),
-                    }
+                    return Err(Error::Protocol(format!(
+                        "Begin handoff_id {handoff_id} does not match \
+                         handshake id {expected}"
+                    )));
                 }
+                Message::Abort { reason, .. } => return Err(Error::Aborted(reason)),
                 Message::Heartbeat { .. } => continue,
                 other => return Err(Error::UnexpectedMessage(message_name(&other))),
             }

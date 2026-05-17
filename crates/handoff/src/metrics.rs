@@ -1,8 +1,10 @@
 //! Observability name constants.
 //!
-//! Implementations emit `tracing` events with these names and metric backends
-//! register counters/histograms with these names so dashboards stay
-//! consistent across primitives.
+//! These are **naming contracts**, not emitted values. The library does not
+//! itself register or update any metric; consumers wire these constants into
+//! their own metrics backend (Prometheus, OpenTelemetry, …) so dashboards
+//! stay consistent across daemons that embed `handoff`. The `tracing` events
+//! in `events::*` are emitted by the library directly.
 
 /// Counters and histograms.
 pub const HANDOFFS_TOTAL: &str = "handoff_handoffs_total";

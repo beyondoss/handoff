@@ -18,13 +18,14 @@ use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use crate::crash::points;
 use crate::crash_here;
 use crate::error::{Error, Result};
-use crate::fd::arrange_inherited_fds_on_spawn;
+use crate::fd::pass_listener_fds_on_spawn;
 use crate::frame::{read_message, write_message};
 use crate::metrics::events;
 use crate::protocol::{
-    HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version,
+    HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version, short_name,
 };
 use crate::state::{Phase, StateJournal};
+use crate::util::now_unix_ms;
 
 /// Floor for any phase read timeout. Reads shorter than this are likely a
 /// programming error (no time left to even receive one frame).
@@ -32,6 +33,10 @@ const MIN_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// Extra slack on top of `drain_grace` for the wire to deliver the `Drained`
 /// frame after the consumer's drain returns.
 const DRAIN_WIRE_BUFFER: Duration = Duration::from_secs(1);
+/// Bound on the initial `Hello` read after connecting to a peer. The peer
+/// writes `Hello` as its first action, so this should be near-instant —
+/// generous slack still bounds a stuck-peer scenario.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One supervised primitive instance.
 pub struct Supervisor {
@@ -217,11 +222,18 @@ impl Supervisor {
 
         // 5. PrepareHandoff → Drained.
         let prepare_at = Instant::now();
+        // Send the budget *remaining*, not the raw configured duration: the
+        // hello exchange and successor spawn have already burned wall-clock
+        // time off the overall deadline, and we want O's view of the
+        // deadline to track ours. Floored at MIN_READ_TIMEOUT so O still
+        // has a usable budget if we cut it very close.
+        let deadline_ms = remaining_until(total_deadline_at).as_millis() as u64;
+        let drain_grace_ms = spec.drain_grace.as_millis() as u64;
         tracing::info!(
             target: events::PREPARE,
             %handoff_id, successor_pid,
-            drain_grace_ms = spec.drain_grace.as_millis() as u64,
-            deadline_ms = spec.deadline.as_millis() as u64,
+            drain_grace_ms,
+            deadline_ms,
             "prepare handoff"
         );
         write_message(
@@ -230,8 +242,8 @@ impl Supervisor {
             &Message::PrepareHandoff {
                 handoff_id,
                 successor_pid,
-                deadline_ms: spec.deadline.as_millis() as u64,
-                drain_grace_ms: spec.drain_grace.as_millis() as u64,
+                deadline_ms,
+                drain_grace_ms,
             },
         )?;
         crash_here!(points::S_AFTER_PREPARE_SENT);
@@ -491,7 +503,17 @@ impl Supervisor {
         expected_role: Side,
         expected_pid: Option<u32>,
     ) -> Result<ProtoVersion> {
-        let (_v, peer_hello) = read_message(stream)?;
+        // Bound the initial Hello so a peer that accepted the connection but
+        // hangs before writing can't block `perform_handoff` indefinitely.
+        // Cleared after the read regardless of outcome.
+        stream.set_read_timeout(Some(HELLO_READ_TIMEOUT))?;
+        let read_result = read_message(stream);
+        let _ = stream.set_read_timeout(None);
+        let (_v, peer_hello) = match read_result {
+            Ok(x) => x,
+            Err(Error::Io(e)) if is_timeout(&e) => return Err(Error::Timeout("peer Hello")),
+            Err(e) => return Err(e),
+        };
         let (their_role, their_pid, their_min, their_max) = match peer_hello {
             Message::Hello {
                 role,
@@ -529,9 +551,7 @@ impl Supervisor {
     }
 
     fn spawn_successor(&self, spec: &SpawnSpec, n_sock_fd: RawFd) -> Result<Child> {
-        let listener_count = self.listener_fds.len();
-        let names: Vec<String> = self.listener_fds.iter().map(|(n, _)| n.clone()).collect();
-        let sock_target_fd = 3 + listener_count as RawFd;
+        let sock_target_fd = 3 + self.listener_fds.len() as RawFd;
 
         let mut cmd = Command::new(&spec.binary);
         cmd.args(&spec.args);
@@ -540,16 +560,14 @@ impl Supervisor {
         }
         cmd.env("HANDOFF_ROLE", "successor");
         cmd.env("HANDOFF_SOCK_FD", sock_target_fd.to_string());
-        cmd.env("LISTEN_FDS", listener_count.to_string());
-        cmd.env("LISTEN_FDNAMES", names.join(":"));
         cmd.stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        // Source FDs in target-order: listeners first (3, 4, ...), then control sock.
-        let mut sources: Vec<RawFd> = self.listener_fds.iter().map(|(_, f)| *f).collect();
-        sources.push(n_sock_fd);
-        arrange_inherited_fds_on_spawn(&mut cmd, sources);
+        // LISTEN_FDS env + FD-shuffle dance. Control socket lands at FD
+        // `3 + listener_count` so the successor reads HANDOFF_SOCK_FD from
+        // its env and finds it there.
+        pass_listener_fds_on_spawn(&mut cmd, &self.listener_fds, Some(n_sock_fd));
 
         let child = cmd.spawn()?;
         Ok(child)
@@ -653,28 +671,3 @@ fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn short_name(msg: &Message) -> &'static str {
-    match msg {
-        Message::Hello { .. } => "Hello",
-        Message::HelloAck { .. } => "HelloAck",
-        Message::PrepareHandoff { .. } => "PrepareHandoff",
-        Message::Drained { .. } => "Drained",
-        Message::SealRequest { .. } => "SealRequest",
-        Message::SealProgress { .. } => "SealProgress",
-        Message::SealComplete { .. } => "SealComplete",
-        Message::SealFailed { .. } => "SealFailed",
-        Message::Begin { .. } => "Begin",
-        Message::Ready { .. } => "Ready",
-        Message::Commit { .. } => "Commit",
-        Message::Abort { .. } => "Abort",
-        Message::ResumeAfterAbort { .. } => "ResumeAfterAbort",
-        Message::Heartbeat { .. } => "Heartbeat",
-    }
-}

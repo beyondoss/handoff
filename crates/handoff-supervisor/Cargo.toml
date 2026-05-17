@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Reference supervisor for handoff-aware daemons"
+# Reference / dev-loop binary, not a shipped product. Embedders link the
+# `beyond-handoff` library directly. Marked `publish = false` so a manual
+# `cargo publish` from the workspace root can't push it.
+publish = false
 
 [[bin]]
 name = "handoff-supervisor"

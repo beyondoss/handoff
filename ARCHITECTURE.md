@@ -256,9 +256,11 @@ The control socket carries one peer at a time, at low throughput, during rare sw
 
 `write tmp + rename` produces an atomic view: the on-disk file is always either the old complete state or the new complete state, never a partial write. `O_DSYNC` only ensures the write itself is durable — it doesn't prevent a torn record if the supervisor crashes mid-write. Rename on Linux ext4/XFS/btrfs is atomic with respect to crash consistency.
 
-### Why heartbeats flow both directions, but only S uses them for timeout
+### Liveness: static read timeouts, with a heartbeat slot reserved
 
-The 5-second heartbeat gap triggers peer-died detection in `read_until()`. Currently only the supervisor side times out based on heartbeats (via `set_read_timeout`). The incumbent echoes heartbeats to keep the S-side timer alive during long drain or seal operations. `SealProgress` frames also reset the timer on the S→O channel during multi-shard seals.
+Peer-died detection runs off `UnixStream::set_read_timeout` on the supervisor side. Each read is bounded by either the configured deadline (drain, seal, ready) or a small fixed window (initial `Hello`). If a read elapses without a frame, the supervisor aborts the handoff: kills N, sends `ResumeAfterAbort` to O, clears the journal.
+
+The protocol reserves a `Heartbeat` message and the incumbent echoes any heartbeat it receives, but the supervisor does not currently emit heartbeats proactively — the static read timeouts are the live mechanism. The echo path is in place so a future change can switch to a heartbeat-reset model (e.g. for very long seals) without a wire-protocol bump.
 
 ## Trust Boundaries
 
@@ -338,7 +340,7 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 
 ## Observability
 
-The library emits `tracing` events at each phase transition and exposes metric name constants via `metrics.rs`. Consumers register counters/histograms with these names so dashboards stay consistent.
+The library emits `tracing` events at each phase transition. The `metrics.rs` module exports **string constants** for the recommended counter/histogram names — the library does **not** itself register or update any metric. Consumers wire the constants into their own metrics backend (Prometheus, OpenTelemetry, …) so dashboards stay consistent across daemons that embed `handoff`. Treat the table below as a naming contract, not a list of values the library publishes.
 
 | Metric Name | Type | What It Measures |
 |-------------|------|-----------------|

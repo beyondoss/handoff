@@ -24,8 +24,9 @@ use crate::frame::{read_message, write_message};
 use crate::lock::DataDirLock;
 use crate::metrics::events;
 use crate::protocol::{
-    Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, Side, negotiate_version,
+    Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, Side, negotiate_version, short_name,
 };
+use crate::util::now_unix_ms;
 
 pub struct Incumbent {
     listener: UnixListener,
@@ -124,12 +125,18 @@ impl Incumbent {
                                 }
                             }
                             Err(e2) => {
+                                // The terminal condition is the flock
+                                // re-acquire failure — surface that to the
+                                // caller rather than the upstream session
+                                // error, since this is what actually prevents
+                                // recovery. The session error is already in
+                                // the log immediately above.
                                 tracing::error!(
                                     error = %e2,
                                     "failed to re-acquire flock after session error; \
                                      incumbent cannot resume"
                                 );
-                                return Err(e);
+                                return Err(e2);
                             }
                         }
                     }
@@ -381,28 +388,3 @@ impl Incumbent {
     }
 }
 
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn short_name(msg: &Message) -> &'static str {
-    match msg {
-        Message::Hello { .. } => "Hello (unexpected)",
-        Message::HelloAck { .. } => "HelloAck (unexpected)",
-        Message::PrepareHandoff { .. } => "PrepareHandoff (unexpected)",
-        Message::Drained { .. } => "Drained (unexpected)",
-        Message::SealRequest { .. } => "SealRequest (unexpected)",
-        Message::SealProgress { .. } => "SealProgress (unexpected)",
-        Message::SealComplete { .. } => "SealComplete (unexpected)",
-        Message::SealFailed { .. } => "SealFailed (unexpected)",
-        Message::Begin { .. } => "Begin (unexpected)",
-        Message::Ready { .. } => "Ready (unexpected)",
-        Message::Commit { .. } => "Commit (unexpected)",
-        Message::Abort { .. } => "Abort (unexpected)",
-        Message::ResumeAfterAbort { .. } => "ResumeAfterAbort (unexpected)",
-        Message::Heartbeat { .. } => "Heartbeat (unexpected)",
-    }
-}

@@ -19,6 +19,8 @@ use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+use crate::role::{ENV_LISTEN_FDNAMES, ENV_LISTEN_FDS};
+
 /// Register a `pre_exec` on `cmd` that, after fork and before `execve`,
 /// places each FD in `sources` at the canonical inherited-FD slot
 /// (`SD_LISTEN_FDS_START + i`). Clears CLOEXEC on every target so the FD
@@ -28,6 +30,33 @@ use std::process::Command;
 /// The caller must keep the underlying open-file resources behind each
 /// source FD alive in the parent until `Command::spawn` returns; otherwise
 /// the FD numbers may be reassigned in the parent before fork.
+/// One-shot setup for passing named listener FDs to a child via the
+/// systemd-style `LISTEN_FDS` / `LISTEN_FDNAMES` convention.
+///
+/// Sets both env vars on `cmd` and registers a single `pre_exec` that
+/// places each listener at `SD_LISTEN_FDS_START + i`. The optional
+/// `extra_fd` is appended at `SD_LISTEN_FDS_START + n` — the supervisor
+/// passes the control socket here so it lands immediately after the
+/// listener block. Setting env vars and FDs in a single helper avoids the
+/// drift hazard of doing them in two places.
+///
+/// Callers must keep the underlying open-file resources behind each FD
+/// alive in the parent until `Command::spawn` returns.
+pub fn pass_listener_fds_on_spawn(
+    cmd: &mut Command,
+    listeners: &[(String, RawFd)],
+    extra_fd: Option<RawFd>,
+) {
+    let names: Vec<String> = listeners.iter().map(|(n, _)| n.clone()).collect();
+    cmd.env(ENV_LISTEN_FDS, listeners.len().to_string());
+    cmd.env(ENV_LISTEN_FDNAMES, names.join(":"));
+    let mut fds: Vec<RawFd> = listeners.iter().map(|(_, f)| *f).collect();
+    if let Some(extra) = extra_fd {
+        fds.push(extra);
+    }
+    arrange_inherited_fds_on_spawn(cmd, fds);
+}
+
 pub fn arrange_inherited_fds_on_spawn(cmd: &mut Command, sources: Vec<RawFd>) {
     // The Vec is pre-allocated in the parent and reused as the staging
     // buffer post-fork — no allocator calls inside the closure.

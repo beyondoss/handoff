@@ -136,6 +136,29 @@ pub enum Message {
     Heartbeat { ts_ms: u64 },
 }
 
+/// Short, stable name for a [`Message`] variant. Used in error messages
+/// and tracing where the full payload is noise. The name is the variant
+/// identifier, nothing more — callers that want "unexpected for state X"
+/// framing should compose it at the call site.
+pub fn short_name(msg: &Message) -> &'static str {
+    match msg {
+        Message::Hello { .. } => "Hello",
+        Message::HelloAck { .. } => "HelloAck",
+        Message::PrepareHandoff { .. } => "PrepareHandoff",
+        Message::Drained { .. } => "Drained",
+        Message::SealRequest { .. } => "SealRequest",
+        Message::SealProgress { .. } => "SealProgress",
+        Message::SealComplete { .. } => "SealComplete",
+        Message::SealFailed { .. } => "SealFailed",
+        Message::Begin { .. } => "Begin",
+        Message::Ready { .. } => "Ready",
+        Message::Commit { .. } => "Commit",
+        Message::Abort { .. } => "Abort",
+        Message::ResumeAfterAbort { .. } => "ResumeAfterAbort",
+        Message::Heartbeat { .. } => "Heartbeat",
+    }
+}
+
 /// Negotiate a single protocol version from two `proto_min..=proto_max` ranges.
 /// Returns the highest version both sides can speak, or [`Error::VersionMismatch`].
 pub fn negotiate_version(

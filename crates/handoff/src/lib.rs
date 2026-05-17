@@ -15,10 +15,11 @@ pub mod protocol;
 pub mod role;
 pub mod state;
 pub mod supervisor;
+mod util;
 
 pub use drainable::{DrainReport, Drainable, ReadinessSnapshot, SealReport, StateSnapshot};
 pub use error::{Error, Result};
-pub use fd::arrange_inherited_fds_on_spawn;
+pub use fd::{arrange_inherited_fds_on_spawn, pass_listener_fds_on_spawn};
 pub use incumbent::Incumbent;
 pub use lock::DataDirLock;
 pub use protocol::HandoffId;

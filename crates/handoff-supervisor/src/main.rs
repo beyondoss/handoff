@@ -31,7 +31,7 @@ use clap::Parser;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use handoff::arrange_inherited_fds_on_spawn;
+use handoff::pass_listener_fds_on_spawn;
 use handoff::supervisor::{SpawnSpec, Supervisor};
 
 #[derive(Parser, Debug)]
@@ -239,15 +239,14 @@ fn spawn_primitive_cold_start(cfg: &Config, listener_fds: &[(String, RawFd)]) ->
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
-    let names: Vec<String> = listener_fds.iter().map(|(n, _)| n.clone()).collect();
-    cmd.env("LISTEN_FDS", listener_fds.len().to_string());
-    cmd.env("LISTEN_FDNAMES", names.join(":"));
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let sources: Vec<RawFd> = listener_fds.iter().map(|(_, f)| *f).collect();
-    arrange_inherited_fds_on_spawn(&mut cmd, sources);
+    // No `HANDOFF_ROLE` — this is a cold start. No control socket either,
+    // so `extra_fd` is `None`. The same helper is used by the library's
+    // successor spawn so the env/FD convention stays in lockstep.
+    pass_listener_fds_on_spawn(&mut cmd, listener_fds, None);
     let child = cmd.spawn().context("cold-start primitive spawn")?;
     Ok(child)
 }
