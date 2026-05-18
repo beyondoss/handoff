@@ -122,15 +122,27 @@ fn run() -> Result<ExitCode> {
                 "HANDOFF_DRAIN_DELAY_MS".into(),
                 std::env::var("HANDOFF_DRAIN_DELAY_MS").unwrap_or_default(),
             ),
+            (
+                "HANDOFF_READY_DELAY_MS".into(),
+                std::env::var("HANDOFF_READY_DELAY_MS").unwrap_or_default(),
+            ),
         ],
         // Test-fixture deadlines: generous enough for the slow-seal
         // test (which sleeps up to 15s in `seal()`) but bounded so a
         // genuine hang fails the test rather than waiting for the
-        // library defaults (5 minutes).
-        deadline: Duration::from_secs(parse_secs_env("HANDOFF_TEST_DEADLINE_SECS").unwrap_or(60)),
-        drain_grace: Duration::from_secs(
-            parse_secs_env("HANDOFF_TEST_DRAIN_GRACE_SECS").unwrap_or(30),
-        ),
+        // library defaults (5 minutes). The wire-race test wants
+        // sub-second `drain_grace`, so we accept it in milliseconds when
+        // set; otherwise fall back to the coarser seconds-grain knob.
+        deadline: parse_ms_env("HANDOFF_TEST_DEADLINE_MS")
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| {
+                Duration::from_secs(parse_secs_env("HANDOFF_TEST_DEADLINE_SECS").unwrap_or(60))
+            }),
+        drain_grace: parse_ms_env("HANDOFF_TEST_DRAIN_GRACE_MS")
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| {
+                Duration::from_secs(parse_secs_env("HANDOFF_TEST_DRAIN_GRACE_SECS").unwrap_or(30))
+            }),
     };
 
     let outcome = sup.perform_handoff(spec).context("perform_handoff")?;
@@ -157,5 +169,9 @@ fn init_logging() {
 }
 
 fn parse_secs_env(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|s| s.parse().ok())
+}
+
+fn parse_ms_env(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|s| s.parse().ok())
 }

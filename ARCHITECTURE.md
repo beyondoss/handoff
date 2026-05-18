@@ -271,7 +271,7 @@ If `ChildGuard` were still armed when the `Commit` write failed (e.g. O crashed 
 The supervisor enforces two independent timeouts on every read from a peer:
 
 - **Liveness (per-recv, `LIVENESS_TIMEOUT = 10s`).** Each `recv` waits at most this long. Any received frame — including a `Heartbeat` — resets the clock. A peer emitting heartbeats every 2s during a long-running hook is therefore *not* declared dead, no matter how long that hook takes.
-- **Wall-clock (per-phase budget).** Regardless of heartbeats, the supervisor aborts once the configured budget elapses: `drain_grace` for the drain phase, `deadline` (overall) for everything else. This bounds the "consumer alive but not making progress" case.
+- **Wall-clock (per-phase budget) + `WIRE_SLACK`.** Regardless of heartbeats, the supervisor aborts once the configured budget elapses: `drain_grace` for the drain phase, `deadline` (overall) for everything else. Each cap is extended by `WIRE_SLACK` (1 s) on the supervisor's read side. The peer's clock for a phase starts when it deserializes the request (`T_s + δ_net`), and a reply produced after running to that budget still has to traverse `δ_net + δ_serialize` on the way back; without the slack, the supervisor would abort a frame already on the wire. The slack is conservative — Unix-socket round-trip + frame serialization is well under 1 s — and is not a tuning knob.
 
 The incumbent feeds this design by spawning a background heartbeat thread for the duration of `Drainable::drain` and `Drainable::seal`. The thread writes a `Heartbeat` frame every `HEARTBEAT_INTERVAL` (2s). When the hook returns, an RAII guard signals the thread to stop and joins it before the main thread sends the next protocol frame — so there is never concurrent writing on the control socket. The 5× safety margin (2s heartbeat vs 10s liveness) absorbs scheduler hiccups.
 
@@ -334,8 +334,8 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 | `listeners` | `[]` | Sockets S binds at startup; inherited by every primitive via LISTEN_FDS |
 | `trigger_socket` | (required) | Unix socket S listens on for `handoff [binary]` trigger commands |
 | `journal` | `None` | If set, S writes phase journal here for crash recovery |
-| `drain_grace_secs` | `25` | Maximum seconds S waits for `Drained` after sending `PrepareHandoff` |
-| `deadline_secs` | `60` | Overall handoff deadline (post-drain through Ready) |
+| `drain_grace_secs` | `25` | Budget S gives O for the drain phase before sending `Drained`; S's read for the reply extends `WIRE_SLACK` (1 s) past this cap |
+| `deadline_secs` | `60` | Overall handoff deadline (post-drain through Ready); S's reads for `SealComplete` and `Ready` extend `WIRE_SLACK` (1 s) past this cap |
 
 ### `SpawnSpec` (library API)
 

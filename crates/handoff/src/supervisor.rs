@@ -47,6 +47,21 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// writes `Hello` as its first action, so this should be near-instant —
 /// generous slack still bounds a stuck-peer scenario.
 const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Slack the supervisor adds on top of any peer-side deadline before
+/// declaring a read timed out.
+///
+/// The peer's clock for a phase starts when it deserializes our request —
+/// `T_s + δ_net`, where `T_s` is the supervisor's send time — and the
+/// response it produces still has to traverse `δ_net + δ_serialize` on the
+/// way back. Without slack, the supervisor's read deadline (which starts
+/// at `T_s`) expires `2·δ_net + δ_serialize` before a peer that ran to its
+/// budget can land its reply on the wire. The reply is in flight; the
+/// supervisor has already given up.
+///
+/// 1s is two orders of magnitude above realistic worst-case Unix-socket
+/// round-trip plus frame serialization, so this is a conservative bound
+/// on the in-flight window — not a knob to tune.
+const WIRE_SLACK: Duration = Duration::from_secs(1);
 
 /// One supervised primitive instance.
 pub struct Supervisor {
@@ -76,13 +91,20 @@ pub struct SpawnSpec {
     /// liveness clock fresh), but it will abort once this wall-clock cap
     /// is exceeded regardless of progress.
     ///
+    /// The supervisor's reads for `SealComplete` and `Ready` extend up to
+    /// `WIRE_SLACK` (1 s) past this cap to pick up replies that were
+    /// already on the wire when the deadline elapsed; total wall time can
+    /// therefore exceed `deadline` by up to that slack.
+    ///
     /// Tuning guidance: set this to `p99(drain) + p99(seal) + 30s`.
     /// Default: 5 minutes.
     pub deadline: Duration,
     /// Wall-clock cap on the `drain` phase specifically. Useful when the
     /// consumer's `drain` has a known upper bound (e.g. drain timeout
     /// configured per-connection) and a tighter cap is wanted than the
-    /// overall `deadline`. Default: 60 seconds.
+    /// overall `deadline`. The supervisor's read for `Drained` extends up
+    /// to `WIRE_SLACK` (1 s) past this cap to pick up an in-flight reply.
+    /// Default: 60 seconds.
     pub drain_grace: Duration,
 }
 
@@ -282,13 +304,22 @@ impl Supervisor {
             },
         )?;
         crash_here!(points::S_AFTER_PREPARE_SENT);
-        // `drain_grace` is the wall-clock cap on the entire drain phase.
-        // The per-recv liveness timeout (inside `read_until`) handles
-        // peer-dead detection separately, so we don't need extra wire
-        // slack — heartbeats reset the recv clock every 2s.
-        let drained_msg = read_until(&mut o_stream, spec.drain_grace, "Drained", |m| {
-            matches!(m, Message::Drained { .. })
-        })?;
+        // `drain_grace` is the budget we hand O for the entire drain
+        // phase: O may consume up to that long inside `Drainable::drain`
+        // before producing a `Drained` frame. Our read deadline must
+        // therefore exceed `drain_grace` by `WIRE_SLACK` — O's clock for
+        // the grace starts when it deserializes `PrepareHandoff`
+        // (T_s + δ_net), and the `Drained` it sends after running to that
+        // limit still has to traverse δ_net + δ_serialize on the way back.
+        // Per-recv liveness handles peer-dead detection inside
+        // `read_until`; the slack is specifically about not aborting a
+        // reply that's already on the wire.
+        let drained_msg = read_until(
+            &mut o_stream,
+            spec.drain_grace + WIRE_SLACK,
+            "Drained",
+            |m| matches!(m, Message::Drained { .. }),
+        )?;
         let (drained_open_conns, drained_accept_closed) = match &drained_msg {
             Message::Drained {
                 open_conns_remaining,
@@ -318,11 +349,15 @@ impl Supervisor {
         crash_here!(points::S_AFTER_SEAL_REQUEST_SENT);
         // Seal-wait loop. Same two-tier timeout as `read_until`: per-recv
         // capped at LIVENESS_TIMEOUT (heartbeats reset it), wall-clock
-        // capped by `total_deadline_at`. `SealProgress` and `Heartbeat`
-        // frames are both progress signals.
+        // capped by `total_deadline_at + WIRE_SLACK`. The slack covers a
+        // `SealComplete` that's already on the wire when the overall
+        // deadline expires — `seal()` runs without an internal deadline,
+        // so it can land its reply arbitrarily close to the cap.
+        // `SealProgress` and `Heartbeat` frames are both progress signals.
+        let seal_read_deadline = total_deadline_at + WIRE_SLACK;
         let seal_outcome: std::result::Result<(), String> = loop {
             let now = Instant::now();
-            if now >= total_deadline_at {
+            if now >= seal_read_deadline {
                 let _ = o_stream.set_read_timeout(None);
                 send_best_effort_abort(
                     &mut n_stream,
@@ -334,7 +369,7 @@ impl Supervisor {
                 self.journal_clear();
                 return Err(Error::Timeout("SealComplete"));
             }
-            let remaining = total_deadline_at - now;
+            let remaining = seal_read_deadline - now;
             let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
             o_stream.set_read_timeout(Some(recv_timeout))?;
             match read_message(&mut o_stream) {
@@ -428,7 +463,12 @@ impl Supervisor {
                         successor_pid,
                         started_unix_ms,
                     )?;
-                    let ready_timeout = remaining_until(total_deadline_at);
+                    // N has no internal deadline for `announce_and_bind`,
+                    // so `Ready` can be in flight at the moment
+                    // `total_deadline_at` elapses — give the read
+                    // `WIRE_SLACK` past that cap for the same reason the
+                    // drain and seal reads do.
+                    let ready_timeout = remaining_until(total_deadline_at) + WIRE_SLACK;
                     read_until(&mut n_stream, ready_timeout, "Ready", |m| {
                         matches!(m, Message::Ready { .. })
                     })

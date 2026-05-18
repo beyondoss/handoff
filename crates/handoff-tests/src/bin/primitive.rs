@@ -83,6 +83,16 @@ fn run_successor(
     let lock = DataDirLock::acquire(data_dir).context("successor acquire flock")?;
 
     crash_here!(primitive_points::N_BEFORE_ANNOUNCE_READY);
+    // Optional artificial delay before `Ready` is written. Used by the
+    // wire-race test for the Ready phase: with N stalled this long, the
+    // `Ready` frame arrives after `total_deadline_at` and the supervisor
+    // must still accept it (within `WIRE_SLACK`).
+    if let Ok(ms) = std::env::var("HANDOFF_READY_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let snapshot = ReadinessSnapshot {
         listening_on: Vec::new(),
         healthz_ok: true,

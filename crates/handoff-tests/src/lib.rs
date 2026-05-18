@@ -152,6 +152,9 @@ impl Fixture {
             fixture: self,
             crash_at_supervisor: None,
             crash_at_successor: None,
+            drain_grace_ms: None,
+            deadline_ms: None,
+            ready_delay_ms: None,
         }
     }
 
@@ -341,6 +344,9 @@ pub struct SupervisorBuilder<'a> {
     fixture: &'a Fixture,
     crash_at_supervisor: Option<&'static str>,
     crash_at_successor: Option<&'static str>,
+    drain_grace_ms: Option<u64>,
+    deadline_ms: Option<u64>,
+    ready_delay_ms: Option<u64>,
 }
 
 impl SupervisorBuilder<'_> {
@@ -355,6 +361,30 @@ impl SupervisorBuilder<'_> {
     /// [`primitive_points`] constant prefixed `N_*`.
     pub fn crash_successor_at(mut self, point: &'static str) -> Self {
         self.crash_at_successor = Some(point);
+        self
+    }
+
+    /// Override the `drain_grace` the supervisor uses for this handoff.
+    /// Wire-race-style tests want sub-second precision, so this takes a
+    /// `Duration` and serializes to milliseconds for the supervisor binary.
+    pub fn drain_grace(mut self, grace: Duration) -> Self {
+        self.drain_grace_ms = Some(grace.as_millis() as u64);
+        self
+    }
+
+    /// Override the overall handoff `deadline` for this run, at ms grain.
+    /// Used by the wire-race tests that need a tight cap to drive
+    /// `total_deadline_at`-bounded reads (`SealComplete`, `Ready`).
+    pub fn deadline(mut self, deadline: Duration) -> Self {
+        self.deadline_ms = Some(deadline.as_millis() as u64);
+        self
+    }
+
+    /// Stall the spawned successor this long between `wait_for_begin` and
+    /// `announce_and_bind` — i.e. before it writes `Ready`. Used by the
+    /// ready-race test to land `Ready` past `total_deadline_at`.
+    pub fn ready_delay(mut self, delay: Duration) -> Self {
+        self.ready_delay_ms = Some(delay.as_millis() as u64);
         self
     }
 
@@ -376,6 +406,22 @@ impl SupervisorBuilder<'_> {
             .env(
                 "HANDOFF_CRASH_AT_FOR_N",
                 self.crash_at_successor.unwrap_or(""),
+            )
+            .env(
+                "HANDOFF_TEST_DRAIN_GRACE_MS",
+                self.drain_grace_ms
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
+            )
+            .env(
+                "HANDOFF_TEST_DEADLINE_MS",
+                self.deadline_ms.map(|m| m.to_string()).unwrap_or_default(),
+            )
+            .env(
+                "HANDOFF_READY_DELAY_MS",
+                self.ready_delay_ms
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
             )
             .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_default())
             .stdin(Stdio::null())
