@@ -4,7 +4,14 @@
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # atomic-polyfill is unmaintained; pulled in transitively via
+    # postcard 1.x → heapless 0.7. postcard 1.x pins heapless 0.7
+    # unconditionally and the advisory states no safe upgrade exists.
+    # Revisit when postcard 2.x (which moves to heapless 0.8 +
+    # portable-atomic) is released.
+    "RUSTSEC-2023-0089",
+]
 
 [licenses]
 allow = [
