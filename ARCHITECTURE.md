@@ -71,9 +71,10 @@ N → S: Ready(handoff_id, listening_on, healthz_ok,                     │
         │                                                                │
         │── COMMIT ───────────────────────────────────────────────────  │
         │                                                                │
-S → O: Commit(handoff_id)                                              │
+S: disarms ChildGuard (N is authoritative from this point)             │
+S → O: Commit(handoff_id)   ← best-effort; failure logged, not fatal  │
 O: drains remaining read conns (bounded by grace timeout); exit(0)    │
-S: disarms ChildGuard, returns HandoffOutcome{committed:true, child:N} │
+S: returns HandoffOutcome{committed:true, child:N}                     │
         └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -105,7 +106,8 @@ Abort trigger (any phase)
                     verifies O is reachable; clears journal file
 
 ChildGuard (Rust RAII) ──► kills + reaps N on any early return from
-                            perform_handoff; disarmed only on Commit
+                            perform_handoff; disarmed on Ready recv,
+                            before the Commit write to O
 ```
 
 ## Concepts & Terminology
@@ -118,7 +120,7 @@ ChildGuard (Rust RAII) ──► kills + reaps N on any early return from
 | `DataDirLock` | RAII `flock(LOCK_EX)` on `<data_dir>/.handoff.lock` + atomic pidfile | Not a mutex; cross-process kernel lock; held by exactly one primitive |
 | `HandoffId` | UUID assigned by S in `HelloAck`; tags every message in one swap | Not a transaction id; not persisted to the data dir |
 | `Phase` | Journal state machine value; written atomically after each protocol step | Not an in-memory state variable; only used for crash recovery |
-| `ChildGuard` | Kills + reaps the spawned child if `perform_handoff` exits early | Not visible outside `supervisor.rs`; pure RAII safety net |
+| `ChildGuard` | Kills + reaps the spawned child on any early return from `perform_handoff`; disarmed on `Ready` recv so N survives even if the Commit write to O fails | Not visible outside `supervisor.rs`; pure RAII safety net |
 | `InheritedListeners` | FD map populated from `LISTEN_FDS`/`LISTEN_FDNAMES`; consumed by `take()` | Not a listener pool; once taken, the entry is gone |
 | Seal | Per-shard: flush buffer, write segment footer, fsync, close file | Not a DB-style "seal" on rows; it's the WAL segment close operation |
 | Drain | Stop accepting, finish in-flight requests, fsync — before seal | Not a graceful shutdown; O keeps serving reads after drain |
@@ -171,8 +173,10 @@ Journal writes use `postcard` serialization; the rename makes each write crash-s
 
 1. Try `acquire()`. If it succeeds, done.
 2. If `LockHeld`, read the pidfile and call `kill(pid, 0)`.
-3. If the PID is dead: unlink the lockfile and pidfile, then `acquire()` on the fresh inode. The kernel already released the flock when the holder died; removing the artifacts is cosmetic.
-4. If the PID is alive: return `StaleLockBreakRefused`. Never break a live holder.
+3. If the PID is alive: return `StaleLockBreakRefused`. Never break a live holder.
+4. If the PID is dead: retry `acquire()` on the same lockfile inode. The kernel released the flock when the holder process died, so the second attempt succeeds. If something is still genuinely holding the flock (an inherited FD outliving the named holder, or a brief PID-reuse race), the retry returns `LockHeld` again and we surface `StaleLockBreakRefused`.
+
+We deliberately do **not** unlink the lockfile and acquire on a fresh inode: that path can split-brain invariant #1 by leaving two processes each holding "the lock" on separate inodes if the original inode's flock is still held. The pidfile is advisory; the kernel-level flock on the existing inode is the source of truth.
 
 See `lock.rs:acquire_or_break_stale()`.
 
@@ -202,7 +206,7 @@ Idle ──start──► Negotiating ──drain ack──► Draining ──se
 | `Sealing` | `SealFailed` recv | `Idle` | Kills N; returns `HandoffOutcome{committed:false}` |
 | `Sealing` | timeout | `Aborting` | Kills N; journal cleared |
 | `Sealing` | `Begin` sent | `AwaitingReady` | Waits for N's `Ready` |
-| `AwaitingReady` | `Ready` recv | `Committed` | Sends `Commit` to O; disarms `ChildGuard` |
+| `AwaitingReady` | `Ready` recv | `Committed` | Disarms `ChildGuard`; sends `Commit` (best-effort) to O; N is now authoritative regardless of Commit outcome |
 | `AwaitingReady` | timeout / N error | `ResumingAfterAbort` | Kills N; sends `ResumeAfterAbort` to O |
 | `Committed` | journal cleared | `Idle` | Returns `HandoffOutcome{committed:true, child:N}` |
 | `ResumingAfterAbort` | journal cleared | `Idle` | Returns `HandoffOutcome{committed:false}` |
@@ -250,17 +254,34 @@ The control socket carries one peer at a time, at low throughput, during rare sw
 
 ### Why `ChildGuard` instead of manual cleanup
 
-`perform_handoff` has many early-return paths (network errors, timeouts, unexpected messages). Without a guard, each early return would need to kill + reap the spawned child. `ChildGuard` drops automatically on every path except the explicit `disarm()` on the commit path. See `supervisor.rs:ChildGuard`.
+`perform_handoff` has many early-return paths (network errors, timeouts, unexpected messages). Without a guard, each early return would need to kill + reap the spawned child. `ChildGuard` drops automatically on every path except the explicit `disarm()`. See `supervisor.rs:ChildGuard`.
+
+### Why `ChildGuard` is disarmed before the `Commit` write
+
+After `Ready` is received, N has acquired the data-dir flock and (via `announce_and_bind`) bound the control socket — N is the authoritative new incumbent from that point regardless of what happens to O. The `Commit` write to O is therefore best-effort cleanup.
+
+If `ChildGuard` were still armed when the `Commit` write failed (e.g. O crashed right after sending `SealComplete`), the `?` propagation would drop the guard and kill N, leaving the system with neither incumbent. Disarming before the write means a dead O cannot take N down with it. The same logic applies to the journal-update that follows: journal failures are logged but not propagated, because the handoff is already committed.
 
 ### Why the state journal uses rename, not O_DSYNC write
 
 `write tmp + rename` produces an atomic view: the on-disk file is always either the old complete state or the new complete state, never a partial write. `O_DSYNC` only ensures the write itself is durable — it doesn't prevent a torn record if the supervisor crashes mid-write. Rename on Linux ext4/XFS/btrfs is atomic with respect to crash consistency.
 
-### Liveness: static read timeouts, with a heartbeat slot reserved
+### Liveness: heartbeats during drain/seal + two-tier supervisor timeout
 
-Peer-died detection runs off `UnixStream::set_read_timeout` on the supervisor side. Each read is bounded by either the configured deadline (drain, seal, ready) or a small fixed window (initial `Hello`). If a read elapses without a frame, the supervisor aborts the handoff: kills N, sends `ResumeAfterAbort` to O, clears the journal.
+The supervisor enforces two independent timeouts on every read from a peer:
 
-The protocol reserves a `Heartbeat` message and the incumbent echoes any heartbeat it receives, but the supervisor does not currently emit heartbeats proactively — the static read timeouts are the live mechanism. The echo path is in place so a future change can switch to a heartbeat-reset model (e.g. for very long seals) without a wire-protocol bump.
+- **Liveness (per-recv, `LIVENESS_TIMEOUT = 10s`).** Each `recv` waits at most this long. Any received frame — including a `Heartbeat` — resets the clock. A peer emitting heartbeats every 2s during a long-running hook is therefore *not* declared dead, no matter how long that hook takes.
+- **Wall-clock (per-phase budget).** Regardless of heartbeats, the supervisor aborts once the configured budget elapses: `drain_grace` for the drain phase, `deadline` (overall) for everything else. This bounds the "consumer alive but not making progress" case.
+
+The incumbent feeds this design by spawning a background heartbeat thread for the duration of `Drainable::drain` and `Drainable::seal`. The thread writes a `Heartbeat` frame every `HEARTBEAT_INTERVAL` (2s). When the hook returns, an RAII guard signals the thread to stop and joins it before the main thread sends the next protocol frame — so there is never concurrent writing on the control socket. The 5× safety margin (2s heartbeat vs 10s liveness) absorbs scheduler hiccups.
+
+The seal-wait loop additionally skips `SealProgress` frames so a consumer with a multi-shard seal can emit explicit progress (`shards_sealed`, `shards_total`, `last_revision`) on top of the implicit heartbeat liveness signal. The payload is consumed silently today; a future version may surface it in metrics.
+
+The default budgets (`deadline = 300s`, `drain_grace = 60s`) are generous. Tuning guidance: set `deadline` to `p99(drain) + p99(seal) + 30s` for your workload. The library does not interrupt long-but-progressing hooks; it does abort once the wall-clock cap is exceeded.
+
+### Flock re-acquire on session error (2 s retry)
+
+When O's `serve()` loop catches a session error and the data-dir flock is not held (i.e. seal completed before the error), it retries `DataDirLock::acquire()` with a 25 ms poll interval for up to 2 s before propagating failure. This covers the race where N acquired the flock after `SealComplete`, then failed before announcing `Ready` — N is still alive just long enough for its flock FD to be in-flight. A fresh acquire after N exits is guaranteed to succeed. If the flock remains held after 2 s, the holder is a legitimate new incumbent and O returns an error, causing the process to exit. See `incumbent.rs:acquire_with_short_retry`.
 
 ## Trust Boundaries
 
@@ -293,7 +314,7 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 | `crates/handoff/src/supervisor.rs` | `Supervisor::perform_handoff()`; `ChildGuard`; journal writes; `spawn_successor()` pre_exec dance |
 | `crates/handoff/src/incumbent.rs` | `Incumbent::serve()`; per-session state machine; flock release on seal |
 | `crates/handoff/src/drainable.rs` | `Drainable` trait + report types (`DrainReport`, `SealReport`, `StateSnapshot`) |
-| `crates/handoff/src/role.rs` | `detect_role()`; `Successor` handshake API; `InheritedListeners` |
+| `crates/handoff/src/role.rs` | `detect_role()`; successor typestate chain (`Successor → HandshookSuccessor → BegunSuccessor`); `InheritedListeners` |
 | `crates/handoff/src/lock.rs` | `DataDirLock` RAII flock; `acquire_or_break_stale()` |
 | `crates/handoff/src/state.rs` | `StateJournal` + `Phase`; atomic write-rename persistence |
 | `crates/handoff/src/error.rs` | `Error` enum; `mpsc` channel conversions |
@@ -330,7 +351,8 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 | N crashes before `Ready` | Socketpair EOF; `ChildGuard` kills + reaps N; S sends `ResumeAfterAbort` to O | O re-acquires flock, calls `resume_after_abort()`, keeps serving |
 | N doesn't send `Ready` before `deadline_ms` | `read_until` times out; S sends `Abort` to N, kills it; sends `ResumeAfterAbort` to O | Same as above |
 | O's `seal()` returns error | O sends `SealFailed`; O immediately calls `resume_after_abort()` (flock never released); S kills N | O stays incumbent; `HandoffOutcome{committed:false}` returned; retry is safe |
-| S crashes during handoff (any phase) | N exits on socketpair EOF; O observes EOF and self-recovers based on phase | If sealed: O re-acquires flock + resumes. If drained: O resumes. Journal cleared on S restart |
+| O crashes after `SealComplete` (Commit write fails) | `ChildGuard` already disarmed at `Ready` recv; Commit write error is logged, not propagated; N holds flock, is the new incumbent | `HandoffOutcome{committed:true, child:N}` returned; O is dead |
+| S crashes during handoff (any phase) | N exits on socketpair EOF; O observes EOF and self-recovers based on phase | If sealed: O re-acquires flock + resumes (2 s retry loop). If drained: O resumes. Journal cleared on S restart |
 | Concurrent `perform_handoff` calls | Second caller gets `Error::HandoffInProgress` immediately from `try_lock` | Caller serializes retries; no protocol message sent to O or N |
 | Second `PrepareHandoff` with different `handoff_id` | O returns `Error::HandoffInProgress`; session closes | S observes disconnect; must start fresh session |
 | Frame > 1 MiB received | `Error::FrameTooLarge`; connection closed | Peer has a bug; reconnect |
@@ -378,11 +400,28 @@ pub trait Drainable: Send + Sync {
 // In the primitive's startup sequence:
 pub fn detect_role() -> Result<Role>;     // Role::ColdStart | Role::Successor
 
+// Successor-side protocol: three typestate types enforce call ordering at
+// compile time. Out-of-order calls (e.g. take_listener before wait_for_begin)
+// don't compile — there's no path from Successor to BegunSuccessor without
+// passing through every preceding state.
 pub struct Successor;
 impl Successor {
-    pub fn handshake(&mut self, build_id: Vec<u8>) -> Result<HandoffId>;
-    pub fn wait_for_begin(&mut self) -> Result<HandoffId>;
+    pub fn handshake(self, build_id: Vec<u8>) -> Result<HandshookSuccessor>;
+    pub fn listener_names(&self) -> Vec<String>;
+}
+
+pub struct HandshookSuccessor;
+impl HandshookSuccessor {
+    pub fn wait_for_begin(self) -> Result<BegunSuccessor>;
+    pub fn handoff_id(&self) -> HandoffId;
+    pub fn listener_names(&self) -> Vec<String>;
+}
+
+pub struct BegunSuccessor;
+impl BegunSuccessor {
     pub fn take_listener(&mut self, name: &str) -> Option<TcpListener>;
+    pub fn handoff_id(&self) -> HandoffId;
+    pub fn listener_names(&self) -> Vec<String>;
     /// Send `Ready`. Caller must NOT bind the control socket until the
     /// prior incumbent has exited (i.e. its `serve()` returned). Prefer
     /// `announce_and_bind` unless you have a specific reason to delay bind.
@@ -419,7 +458,7 @@ pub mod supervisor {
     pub struct Supervisor;
     impl Supervisor {
         pub fn new(socket_path: &Path) -> Result<Self>;
-        pub fn add_listener(&mut self, name: impl Into<String>, fd: RawFd) -> &mut Self;
+        pub fn with_listener(self, name: impl Into<String>, fd: RawFd) -> Self;
         pub fn with_journal(self, path: PathBuf) -> Self;
         pub fn with_build_id(self, build_id: Vec<u8>) -> Self;
         pub fn perform_handoff(&self, spec: SpawnSpec) -> Result<HandoffOutcome>;

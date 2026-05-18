@@ -24,7 +24,7 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -46,6 +46,7 @@ struct Cli {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     /// Where the primitive `Incumbent::bind`s its control socket.
     control_socket: PathBuf,
@@ -75,6 +76,7 @@ fn default_deadline_secs() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListenerConfig {
     name: String,
     addr: String,
@@ -112,7 +114,7 @@ fn main() -> Result<()> {
     // Build the supervisor that will drive future handoffs.
     let mut sup = Supervisor::new(&cfg.control_socket)?;
     for (name, fd) in &listener_fds {
-        sup.add_listener(name.clone(), *fd);
+        sup = sup.with_listener(name.clone(), *fd);
     }
     if let Some(j) = &cfg.journal {
         sup = sup.with_journal(j.clone());
@@ -206,16 +208,29 @@ fn handle_trigger(
                 && let Ok(mut current) = current_child.lock()
             {
                 let outgoing_pid = current.id();
-                match current.wait() {
-                    Ok(status) => tracing::info!(
+                // Bounded reap: O should return from `serve()` as soon as
+                // it processes `Commit`. If it doesn't (buggy Drainable
+                // hanging in cleanup, or `Commit` lost to a crash), don't
+                // let it block the trigger handler from accepting the
+                // next handoff. Move on after the grace period; the OS
+                // will eventually reap the orphan.
+                let reap_grace = Duration::from_secs(cfg.deadline_secs);
+                match wait_child_with_timeout(&mut current, reap_grace) {
+                    Some(Ok(status)) => tracing::info!(
                         pid = outgoing_pid,
                         status = ?status,
                         "outgoing primitive exited"
                     ),
-                    Err(e) => tracing::warn!(
+                    Some(Err(e)) => tracing::warn!(
                         pid = outgoing_pid,
                         error = %e,
                         "failed to reap outgoing primitive"
+                    ),
+                    None => tracing::warn!(
+                        pid = outgoing_pid,
+                        grace_secs = cfg.deadline_secs,
+                        "outgoing primitive did not exit within reap grace; \
+                         abandoning to OS reaper and proceeding"
                     ),
                 }
                 *current = new_child;
@@ -226,6 +241,30 @@ fn handle_trigger(
         }
         Some(other) => Ok(format!("err: unknown command '{other}'")),
         None => Ok("err: empty command".to_string()),
+    }
+}
+
+/// Poll-wait on a child up to `timeout`. Returns `Some(result)` if the
+/// child exited within the window, `None` if the timeout expired first.
+/// 50 ms poll interval — child exits are rare and the cost of one extra
+/// syscall per tick is negligible compared to keeping the trigger handler
+/// unblocked.
+fn wait_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(Ok(status)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Some(Err(e)),
+        }
     }
 }
 

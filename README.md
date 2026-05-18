@@ -91,10 +91,12 @@ fn main() -> anyhow::Result<()> {
             serve(listener, db);
         }
 
-        Role::Successor(mut s) => {
+        Role::Successor(s) => {
             // Spawned by the supervisor during a swap.
-            s.handshake(build_id())?;
-            s.wait_for_begin()?; // blocks until incumbent has sealed and released flock
+            // handshake/wait_for_begin use consuming typestates so the compiler
+            // enforces call order: Successor → HandshookSuccessor → BegunSuccessor.
+            let s = s.handshake(build_id())?;
+            let mut s = s.wait_for_begin()?; // blocks until incumbent has sealed and released flock
 
             let listener = s.take_listener("http").expect("supervisor must pass http listener");
             let lock = DataDirLock::acquire(data_dir)?; // always succeeds; incumbent released it
@@ -156,8 +158,8 @@ echo "handoff /usr/local/bin/my-daemon-v2" | socat - UNIX-CONNECT:/run/my-daemon
 use handoff::supervisor::{Supervisor, SpawnSpec};
 use std::time::Duration;
 
-let mut sup = Supervisor::new(Path::new("/run/my-daemon/handoff.sock"))?;
-sup.add_listener("http", tcp_listener.as_raw_fd());
+let sup = Supervisor::new(Path::new("/run/my-daemon/handoff.sock"))?
+    .with_listener("http", tcp_listener.as_raw_fd());
 sup.resume_from_journal()?; // clear any prior crash state
 
 let outcome = sup.perform_handoff(SpawnSpec {

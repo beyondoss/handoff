@@ -5,6 +5,12 @@
 //! tokio for the rest of its orchestration; primitive embedders (guest-agent,
 //! beyond-pg) can run `perform_handoff` from a worker thread.
 
+// `FromRawFd` on the socketpair endpoints in `make_socketpair` is `unsafe`
+// because the safe wrapper assumes exclusive ownership of the FD; the
+// `socketpair(2)` syscall has just produced both FDs and handed us
+// ownership, so the invariant holds.
+#![allow(unsafe_code)]
+
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -30,9 +36,13 @@ use crate::util::now_unix_ms;
 /// Floor for any phase read timeout. Reads shorter than this are likely a
 /// programming error (no time left to even receive one frame).
 const MIN_READ_TIMEOUT: Duration = Duration::from_millis(100);
-/// Extra slack on top of `drain_grace` for the wire to deliver the `Drained`
-/// frame after the consumer's drain returns.
-const DRAIN_WIRE_BUFFER: Duration = Duration::from_secs(1);
+/// Maximum time the supervisor will wait on any one socket read for a
+/// frame from a peer before declaring that peer dead. Each successful
+/// read — including a `Heartbeat` — resets this clock. The incumbent
+/// emits a heartbeat every 2s while blocked in `drain`/`seal`, so this
+/// gives a 5× margin against scheduler hiccups before falsely concluding
+/// the peer has died.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on the initial `Hello` read after connecting to a peer. The peer
 /// writes `Hello` as its first action, so this should be near-instant —
 /// generous slack still bounds a stuck-peer scenario.
@@ -58,20 +68,38 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     /// Extra env vars to pass to the child (in addition to the handoff envelope).
     pub env: Vec<(String, String)>,
-    /// Overall deadline for the handoff (post-drain through ready).
+    /// Absolute wall-clock cap on the entire handoff, from
+    /// `perform_handoff` start through `Commit` send. Sized to comfortably
+    /// exceed the consumer's `Drainable::drain` + `Drainable::seal` p99
+    /// under load — the library does not interrupt long-but-progressing
+    /// hooks (heartbeats from the incumbent keep the supervisor's
+    /// liveness clock fresh), but it will abort once this wall-clock cap
+    /// is exceeded regardless of progress.
+    ///
+    /// Tuning guidance: set this to `p99(drain) + p99(seal) + 30s`.
+    /// Default: 5 minutes.
     pub deadline: Duration,
-    /// Maximum time to spend in `drain` before moving on (or aborting).
+    /// Wall-clock cap on the `drain` phase specifically. Useful when the
+    /// consumer's `drain` has a known upper bound (e.g. drain timeout
+    /// configured per-connection) and a tighter cap is wanted than the
+    /// overall `deadline`. Default: 60 seconds.
     pub drain_grace: Duration,
 }
 
-impl Default for SpawnSpec {
-    fn default() -> Self {
+impl SpawnSpec {
+    /// Build a spec for `binary` with the recommended defaults: 5 minute
+    /// overall `deadline`, 60 second `drain_grace`, empty `args` and `env`.
+    /// Mutate the returned value or build the struct directly when you need
+    /// non-default fields. `binary` is required because the library has no
+    /// useful fallback — accepting a default of `PathBuf::new()` would just
+    /// fail at `Command::spawn` later with a confusing OS error.
+    pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
-            binary: PathBuf::new(),
+            binary: binary.into(),
             args: Vec::new(),
             env: Vec::new(),
-            deadline: Duration::from_secs(60),
-            drain_grace: Duration::from_secs(25),
+            deadline: Duration::from_secs(300),
+            drain_grace: Duration::from_secs(60),
         }
     }
 }
@@ -155,9 +183,16 @@ impl Supervisor {
     }
 
     /// Register an inherited listener. The supervisor must keep the underlying
-    /// TcpListener alive elsewhere; this just records the raw FD and the name
-    /// to advertise via `LISTEN_FDNAMES`.
-    pub fn add_listener(&mut self, name: impl Into<String>, fd: RawFd) -> &mut Self {
+    /// `TcpListener` alive elsewhere; this just records the raw FD and the
+    /// name to advertise via `LISTEN_FDNAMES`. Consuming-builder shape so it
+    /// composes with `with_journal` / `with_build_id`:
+    ///
+    /// ```ignore
+    /// let sup = Supervisor::new(path)?
+    ///     .with_listener("http", fd)
+    ///     .with_journal(journal_path);
+    /// ```
+    pub fn with_listener(mut self, name: impl Into<String>, fd: RawFd) -> Self {
         self.listener_fds.push((name.into(), fd));
         self
     }
@@ -247,8 +282,11 @@ impl Supervisor {
             },
         )?;
         crash_here!(points::S_AFTER_PREPARE_SENT);
-        let drain_timeout = spec.drain_grace + DRAIN_WIRE_BUFFER;
-        let drained_msg = read_until(&mut o_stream, drain_timeout, |m| {
+        // `drain_grace` is the wall-clock cap on the entire drain phase.
+        // The per-recv liveness timeout (inside `read_until`) handles
+        // peer-dead detection separately, so we don't need extra wire
+        // slack — heartbeats reset the recv clock every 2s.
+        let drained_msg = read_until(&mut o_stream, spec.drain_grace, "Drained", |m| {
             matches!(m, Message::Drained { .. })
         })?;
         let (drained_open_conns, drained_accept_closed) = match &drained_msg {
@@ -278,9 +316,27 @@ impl Supervisor {
             &Message::SealRequest { handoff_id },
         )?;
         crash_here!(points::S_AFTER_SEAL_REQUEST_SENT);
-        let seal_timeout = remaining_until(total_deadline_at);
-        o_stream.set_read_timeout(Some(seal_timeout))?;
+        // Seal-wait loop. Same two-tier timeout as `read_until`: per-recv
+        // capped at LIVENESS_TIMEOUT (heartbeats reset it), wall-clock
+        // capped by `total_deadline_at`. `SealProgress` and `Heartbeat`
+        // frames are both progress signals.
         let seal_outcome: std::result::Result<(), String> = loop {
+            let now = Instant::now();
+            if now >= total_deadline_at {
+                let _ = o_stream.set_read_timeout(None);
+                send_best_effort_abort(
+                    &mut n_stream,
+                    chosen_n,
+                    handoff_id,
+                    "seal phase timed out".into(),
+                );
+                child_guard.kill_and_reap();
+                self.journal_clear();
+                return Err(Error::Timeout("SealComplete"));
+            }
+            let remaining = total_deadline_at - now;
+            let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
+            o_stream.set_read_timeout(Some(recv_timeout))?;
             match read_message(&mut o_stream) {
                 Ok((_, Message::SealProgress { .. })) => continue,
                 Ok((_, Message::Heartbeat { .. })) => continue,
@@ -300,14 +356,17 @@ impl Supervisor {
                     return Err(Error::UnexpectedMessage(short_name(&other)));
                 }
                 Err(Error::Io(e)) if is_timeout(&e) => {
+                    // No frame for `recv_timeout` — peer has gone silent
+                    // for longer than LIVENESS_TIMEOUT (or we're at the
+                    // overall wall-clock cap; the next loop iteration
+                    // detects that explicitly). Treat as peer-dead and
+                    // abort.
                     let _ = o_stream.set_read_timeout(None);
-                    let _ = write_message(
+                    send_best_effort_abort(
                         &mut n_stream,
                         chosen_n,
-                        &Message::Abort {
-                            handoff_id,
-                            reason: "seal phase timed out".into(),
-                        },
+                        handoff_id,
+                        "incumbent unresponsive during seal".into(),
                     );
                     child_guard.kill_and_reap();
                     self.journal_clear();
@@ -327,13 +386,11 @@ impl Supervisor {
                 target: events::ABORT,
                 %handoff_id, error = %error, "seal failed; aborting handoff"
             );
-            let _ = write_message(
+            send_best_effort_abort(
                 &mut n_stream,
                 chosen_n,
-                &Message::Abort {
-                    handoff_id,
-                    reason: format!("seal failed: {error}"),
-                },
+                handoff_id,
+                format!("seal failed: {error}"),
             );
             child_guard.kill_and_reap();
             self.journal_clear();
@@ -354,20 +411,42 @@ impl Supervisor {
         self.journal_set(handoff_id, Phase::Sealing, successor_pid, started_unix_ms)?;
 
         // 7. Begin → Ready (deadline-bounded).
+        //
+        // The Begin write and the Ready read are funneled through one
+        // `Result<Message>` so a failure at either step lands in the same
+        // abort/resume flow below — sending `ResumeAfterAbort` to O is the
+        // correct response in both cases (N is unreachable; O has sealed
+        // and must be told to keep serving).
         let begin_at = Instant::now();
-        write_message(&mut n_stream, chosen_n, &Message::Begin { handoff_id })?;
-        crash_here!(points::S_AFTER_BEGIN_SENT);
-        self.journal_set(
-            handoff_id,
-            Phase::AwaitingReady,
-            successor_pid,
-            started_unix_ms,
-        )?;
+        let ready_result =
+            match write_message(&mut n_stream, chosen_n, &Message::Begin { handoff_id }) {
+                Ok(()) => {
+                    crash_here!(points::S_AFTER_BEGIN_SENT);
+                    self.journal_set(
+                        handoff_id,
+                        Phase::AwaitingReady,
+                        successor_pid,
+                        started_unix_ms,
+                    )?;
+                    let ready_timeout = remaining_until(total_deadline_at);
+                    read_until(&mut n_stream, ready_timeout, "Ready", |m| {
+                        matches!(m, Message::Ready { .. })
+                    })
+                }
+                Err(e) => Err(e),
+            };
 
-        let ready_timeout = remaining_until(total_deadline_at);
-        let ready_result = read_until(&mut n_stream, ready_timeout, |m| {
-            matches!(m, Message::Ready { .. })
-        });
+        // The `Ready` match arm pulls the handoff_id apart so a mismatched id
+        // produces a precise error rather than the misleading
+        // "expected Ready, got Ready" string the generic `other` arm would
+        // emit when `short_name` was called on a `Message::Ready` with the
+        // wrong id.
+        let ready_result = match ready_result {
+            Ok(Message::Ready { handoff_id: id, .. }) if id != handoff_id => Err(Error::Protocol(
+                format!("Ready carries wrong handoff_id: got {id}, expected {handoff_id}"),
+            )),
+            other => other,
+        };
 
         match ready_result {
             Ok(Message::Ready {
@@ -386,6 +465,17 @@ impl Supervisor {
                     "successor ready"
                 );
                 crash_here!(points::S_AFTER_READY_RECV);
+                // N has acknowledged readiness — N has acquired the flock
+                // and (when using `announce_and_bind`) bound the control
+                // socket, so N is the authoritative new incumbent from
+                // this point on regardless of what happens with O.
+                //
+                // Disarm the guard *before* the Commit write so a dead-O
+                // write failure does not propagate via `?` and let the
+                // guard's Drop kill the legitimate new incumbent. Any
+                // I/O after this point is best-effort cleanup of O.
+                let child = child_guard.disarm();
+
                 // 8. Commit O.
                 tracing::info!(
                     target: events::COMMIT,
@@ -393,13 +483,27 @@ impl Supervisor {
                     total_seconds = started_instant.elapsed().as_secs_f64(),
                     "commit"
                 );
-                write_message(&mut o_stream, chosen_o, &Message::Commit { handoff_id })?;
+                if let Err(e) =
+                    write_message(&mut o_stream, chosen_o, &Message::Commit { handoff_id })
+                {
+                    tracing::warn!(
+                        %handoff_id, error = %e,
+                        "failed to send Commit to incumbent; O may have crashed — \
+                         N is the new incumbent regardless, handoff is committed"
+                    );
+                }
                 crash_here!(points::S_AFTER_COMMIT_SENT);
-                self.journal_set(handoff_id, Phase::Committed, successor_pid, started_unix_ms)?;
+                // Journal updates are best-effort here: the handoff is
+                // committed and N is serving. A failure to journal
+                // `Committed` means the next supervisor sees `AwaitingReady`
+                // and runs its standard recovery — also fine.
+                if let Err(e) =
+                    self.journal_set(handoff_id, Phase::Committed, successor_pid, started_unix_ms)
+                {
+                    tracing::warn!(%handoff_id, error = %e, "journal Committed failed");
+                }
                 self.journal_clear();
                 crash_here!(points::S_AFTER_JOURNAL_CLEAR);
-                // N is now the legitimate writer — hand its Child out to caller.
-                let child = child_guard.disarm();
                 Ok(HandoffOutcome {
                     handoff_id,
                     committed: true,
@@ -418,14 +522,7 @@ impl Supervisor {
                     %handoff_id, reason, "aborting handoff before commit"
                 );
                 // Abort N, resume O.
-                let _ = write_message(
-                    &mut n_stream,
-                    chosen_n,
-                    &Message::Abort {
-                        handoff_id,
-                        reason: reason.clone(),
-                    },
-                );
+                send_best_effort_abort(&mut n_stream, chosen_n, handoff_id, reason.clone());
                 child_guard.kill_and_reap();
                 write_message(
                     &mut o_stream,
@@ -480,9 +577,18 @@ impl Supervisor {
             Ok(mut stream) => {
                 // Drain the incumbent's Hello frame so the new session is
                 // clean; then drop the connection — incumbent observes EOF
-                // and its session-close path runs.
+                // and its session-close path runs. A read error here is not
+                // fatal (the EOF on drop still triggers the incumbent's
+                // session-close path) but we log it at debug so a corrupted
+                // Hello can be correlated post-mortem.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = read_message(&mut stream);
+                if let Err(e) = read_message(&mut stream) {
+                    tracing::debug!(
+                        error = %e,
+                        "incumbent Hello read failed during journal resume probe; \
+                         continuing — EOF on drop will reset incumbent session"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "incumbent unreachable during journal resume");
@@ -606,6 +712,28 @@ impl Supervisor {
     }
 }
 
+/// Best-effort send of an `Abort` to the successor on a path where we have
+/// already decided to tear N down (kill+reap follows). Logs at WARN if the
+/// write fails — N may have died or its socket may already be closed, which
+/// is expected on these paths, but a silent discard would hide cases where
+/// the supervisor's view diverges from the child's.
+fn send_best_effort_abort(
+    stream: &mut UnixStream,
+    version: ProtoVersion,
+    handoff_id: HandoffId,
+    reason: String,
+) {
+    let reason_for_log = reason.clone();
+    if let Err(e) = write_message(stream, version, &Message::Abort { handoff_id, reason }) {
+        tracing::warn!(
+            %handoff_id,
+            reason = %reason_for_log,
+            error = %e,
+            "best-effort Abort to successor failed; child will still be killed and reaped"
+        );
+    }
+}
+
 fn make_socketpair() -> Result<(UnixStream, UnixStream)> {
     let (a, b) = socketpair(
         AddressFamily::Unix,
@@ -626,22 +754,52 @@ fn make_socketpair() -> Result<(UnixStream, UnixStream)> {
 }
 
 /// Read messages from `stream` until `pred` matches, ignoring incoming
-/// `Heartbeat`s. Bounded by `timeout` (clamped to at least `MIN_READ_TIMEOUT`).
-fn read_until<F>(stream: &mut UnixStream, timeout: Duration, pred: F) -> Result<Message>
+/// `Heartbeat` and `SealProgress` frames (both are pure liveness/progress
+/// signals — never the message a caller is blocking on). Two timeouts
+/// apply:
+///
+/// - **Liveness** (per-recv): each socket read waits at most
+///   [`LIVENESS_TIMEOUT`]. Any incoming frame — including a `Heartbeat`
+///   — resets this clock. A peer that emits heartbeats every 2s while
+///   blocked in a long-running `Drainable::drain` or `Drainable::seal`
+///   is therefore *not* declared dead, no matter how long the hook
+///   takes.
+/// - **Wall-clock** (overall budget): regardless of heartbeats, the
+///   call returns `Error::Timeout(awaiting)` once the `timeout` budget
+///   has elapsed. This bounds catastrophic cases — consumer hook alive
+///   but not making progress — from running forever.
+///
+/// `awaiting` names the message the caller is blocking on; it surfaces
+/// in the timeout error so an operator's log identifies which protocol
+/// step expired (e.g. `Timeout("Drained")` vs `Timeout("Ready")`).
+fn read_until<F>(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    awaiting: &'static str,
+    pred: F,
+) -> Result<Message>
 where
     F: Fn(&Message) -> bool,
 {
     let deadline = Instant::now() + timeout.max(MIN_READ_TIMEOUT);
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(MIN_READ_TIMEOUT)
-            .max(MIN_READ_TIMEOUT);
-        stream.set_read_timeout(Some(remaining))?;
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = stream.set_read_timeout(None);
+            return Err(Error::Timeout(awaiting));
+        }
+        let remaining = deadline - now;
+        // Per-recv timeout: bounded above by LIVENESS_TIMEOUT (peer-dead
+        // detection), below by what's left of the overall budget. Each
+        // successful frame — heartbeat or otherwise — resets this on
+        // the next iteration.
+        let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
+        stream.set_read_timeout(Some(recv_timeout))?;
         match read_message(stream) {
             Ok((_, Message::Heartbeat { .. })) => continue,
+            Ok((_, Message::SealProgress { .. })) => continue,
             Ok((_, msg)) if pred(&msg) => {
-                stream.set_read_timeout(None)?;
+                let _ = stream.set_read_timeout(None);
                 return Ok(msg);
             }
             Ok((_, other)) => {
@@ -650,7 +808,7 @@ where
             }
             Err(Error::Io(e)) if is_timeout(&e) => {
                 let _ = stream.set_read_timeout(None);
-                return Err(Error::Timeout("expected message"));
+                return Err(Error::Timeout(awaiting));
             }
             Err(e) => {
                 let _ = stream.set_read_timeout(None);
@@ -670,4 +828,3 @@ fn remaining_until(deadline: Instant) -> Duration {
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
-

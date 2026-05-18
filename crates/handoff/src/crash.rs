@@ -16,6 +16,10 @@
 //! - `_exit` writes a marker file before exiting so the harness can verify
 //!   the *intended* crash point fired, not some unrelated abort.
 
+// `maybe_crash` calls `libc::_exit` to bypass Rust destructors and simulate
+// SIGKILL. That is the entire point of this module — see the file header.
+#![allow(unsafe_code)]
+
 /// Inject a crash point at the call site. No-op without the `crash-points`
 /// feature.
 ///

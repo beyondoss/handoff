@@ -8,6 +8,8 @@
 //! The journal lives at `/var/lib/beyond/handoff/<svc>/state.bin` by
 //! convention; the location is supplied by the consumer.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -49,14 +51,33 @@ pub struct StateJournal {
 
 impl StateJournal {
     /// Atomically write the journal. Creates the parent directory if missing.
+    ///
+    /// Writes the payload to `<path>.tmp`, fsyncs it, renames, then fsyncs
+    /// the parent directory. The file fsync makes the contents durable;
+    /// the directory fsync makes the rename's link-update durable. Without
+    /// the directory fsync the rename can be lost on power failure even
+    /// though the file contents survived — leaving a journaled phase that
+    /// silently rolls back to the prior entry on supervisor restart. Pairs
+    /// with the same pattern in `lock.rs::write_pid_atomic`.
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("bin.tmp");
         let bytes = postcard::to_allocvec(self)?;
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
         Ok(())
     }
 
@@ -77,6 +98,19 @@ impl StateJournal {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// fsync a directory inode so a rename or unlink performed on a file
+/// within it becomes crash-durable. `File::open` on a directory is
+/// read-only on POSIX; we just need a usable FD to pass to `fsync`.
+/// Empty paths fall back to the current directory.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    let target = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    File::open(target)?.sync_all()
 }
 
 #[cfg(test)]

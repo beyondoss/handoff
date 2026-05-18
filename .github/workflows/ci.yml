@@ -57,3 +57,57 @@ jobs:
         # log output coherent on failure without slowing the suite — each
         # scenario takes <100ms.
         run: cargo test -p handoff-tests --test crash_matrix --test happy_path -- --test-threads=1 --nocapture
+
+  flake-detection:
+    name: Flake detection (crash matrix × 20)
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fixture binaries
+        run: cargo build -p handoff-tests --bins --tests
+      - name: Run crash matrix 20× consecutively
+        env:
+          RUST_LOG: warn
+        # The `S_AFTER_BEGIN_SENT` test exercises a real race between N's
+        # `Ready` write to a dying socket and O's flock re-acquire. The
+        # convergence assertion holds either way, but `S_AFTER_BEGIN_SENT`
+        # would have shipped flaky if we hadn't dedicated a job to it.
+        # 20 reruns surfaces ~5%-rate flakes with >99% confidence.
+        run: |
+          set -e
+          for i in $(seq 1 20); do
+            echo "--- run $i ---"
+            cargo test -p handoff-tests --test crash_matrix -- --test-threads=1 \
+              || { echo "::error::flake on run $i"; exit 1; }
+          done
+
+  stress:
+    name: Stress test (100 sequential handoffs)
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run stress test
+        # Asserts FD-stability across 100 handoffs — surfaces parent-side
+        # leaks (socketpair, listener, log handles) that single-shot
+        # tests never trigger.
+        run: cargo test -p handoff-tests --test stress
+
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # `bans` excluded — we run that locally to catch duplicate-dep
+          # bloat at PR time but don't gate CI on transitive dupes.
+          command: check advisories licenses sources

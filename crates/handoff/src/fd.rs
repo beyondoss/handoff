@@ -15,6 +15,11 @@
 //! then closing the staging copies. All syscalls in the post-fork closure
 //! are async-signal-safe.
 
+// Post-fork code path uses raw libc (`fcntl`, `dup2`, `close`, `_exit`)
+// because the alternatives (allocator, locks, drop glue) are not
+// async-signal-safe between `fork(2)` and `execve(2)`.
+#![allow(unsafe_code)]
+
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;

@@ -54,9 +54,6 @@ pub enum Error {
     #[error("handoff already in progress")]
     HandoffInProgress,
 
-    #[error("seal failed: {0}")]
-    SealFailed(String),
-
     #[error("handoff aborted by peer: {0}")]
     Aborted(String),
 

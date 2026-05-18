@@ -51,7 +51,7 @@ impl Drainable for MockDrainable {
     fn seal(&self) -> handoff::Result<SealReport> {
         let mut s = self.state.lock().unwrap();
         if s.seal_should_fail {
-            return Err(handoff::Error::SealFailed("mock seal failure".into()));
+            return Err(handoff::Error::Protocol("mock seal failure".into()));
         }
         s.sealed = true;
         Ok(SealReport {

@@ -1,0 +1,35 @@
+# cargo-deny config — supply-chain / license / advisory gates for CI.
+#
+# Run locally with: cargo deny check
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Surface accidental duplicate dep versions — a frequent cause of bloat
+# in deep dep trees. `warn` rather than `deny` so a single transitive
+# duplicate doesn't block CI; review on bump.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -61,18 +61,19 @@ fn run_cold_start(data_dir: &std::path::Path, control_socket: &std::path::Path) 
 }
 
 fn run_successor(
-    mut succ: handoff::Successor,
+    succ: handoff::Successor,
     data_dir: &std::path::Path,
     control_socket: &std::path::Path,
 ) -> Result<()> {
     write_marker_pid("successor-pid", std::process::id());
     crash_here!(primitive_points::N_BEFORE_HANDSHAKE);
-    succ.handshake(b"handoff-test".to_vec())
+    let succ = succ
+        .handshake(b"handoff-test".to_vec())
         .context("handshake")?;
     write_marker("successor-handshake");
     crash_here!(primitive_points::N_AFTER_HANDSHAKE);
 
-    succ.wait_for_begin().context("wait_for_begin")?;
+    let succ = succ.wait_for_begin().context("wait_for_begin")?;
     write_marker("successor-begin");
     crash_here!(primitive_points::N_AFTER_BEGIN);
 
@@ -111,6 +112,12 @@ fn write_marker_pid(name: &str, pid: u32) {
 #[derive(Clone)]
 struct TestDrainable {
     seal_fails_once: Arc<AtomicBool>,
+    /// Optional artificial delay inside `seal()`. Used by the slow-seal
+    /// test to verify the supervisor's liveness-timeout + heartbeat path
+    /// lets a long-but-progressing seal complete.
+    seal_delay_ms: u64,
+    /// Same, but for `drain()`.
+    drain_delay_ms: u64,
     drain_count: Arc<AtomicU32>,
     seal_count: Arc<AtomicU32>,
     resume_count: Arc<AtomicU32>,
@@ -119,8 +126,18 @@ struct TestDrainable {
 impl TestDrainable {
     fn from_env() -> Self {
         let fails = std::env::var("HANDOFF_SEAL_FAILS_ONCE").as_deref() == Ok("1");
+        let seal_delay_ms = std::env::var("HANDOFF_SEAL_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let drain_delay_ms = std::env::var("HANDOFF_DRAIN_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             seal_fails_once: Arc::new(AtomicBool::new(fails)),
+            seal_delay_ms,
+            drain_delay_ms,
             drain_count: Arc::new(AtomicU32::new(0)),
             seal_count: Arc::new(AtomicU32::new(0)),
             resume_count: Arc::new(AtomicU32::new(0)),
@@ -133,6 +150,9 @@ impl Drainable for TestDrainable {
         self.drain_count.fetch_add(1, Ordering::SeqCst);
         write_marker("drain-called");
         crash_here!(primitive_points::O_INSIDE_DRAIN);
+        if self.drain_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.drain_delay_ms));
+        }
         Ok(DrainReport {
             open_conns_remaining: 0,
             accept_closed: true,
@@ -144,7 +164,10 @@ impl Drainable for TestDrainable {
         write_marker("seal-called");
         crash_here!(primitive_points::O_INSIDE_SEAL);
         if self.seal_fails_once.swap(false, Ordering::SeqCst) {
-            return Err(handoff::Error::SealFailed("injected seal failure".into()));
+            return Err(handoff::Error::Protocol("injected seal failure".into()));
+        }
+        if self.seal_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.seal_delay_ms));
         }
         // Touch the library's S-side point name to keep the const referenced
         // in fixture code (helps catch accidental const removal).

@@ -11,15 +11,36 @@ use crate::error::Result;
 ///
 /// All methods are sync. Consumers that run on an async runtime bridge to it
 /// via channels — see `ARCHITECTURE.md` for the recommended pattern.
+///
+/// # Long-running hooks are fine
+///
+/// While `drain` and `seal` are executing, the incumbent runs a background
+/// thread that emits `Heartbeat` frames every ~2s on the control socket.
+/// The supervisor's per-recv liveness timeout (10s) is reset by each
+/// heartbeat, so a hook that takes 30s, 5 minutes, or longer will *not*
+/// trip a peer-dead timeout — only an unresponsive peer (no frames for
+/// over 10 seconds) will. The overall handoff is still bounded by
+/// `SpawnSpec::deadline` (5 minutes by default; size it above the p99 of
+/// `drain` + `seal` for your workload).
 pub trait Drainable: Send + Sync {
     /// Stop accepting new connections, cancel background tasks, drain in-flight
     /// requests, reject new writes. Reads on already-accepted connections may
     /// continue. Must `fsync` before returning so no acked write is lost.
+    ///
+    /// Bounded by `deadline` (passed in) and by `SpawnSpec::drain_grace`
+    /// (wall-clock cap on the supervisor side). Slow-but-progressing drains
+    /// are kept alive by the library's heartbeat thread — there's no need
+    /// to artificially shorten the work to fit a tight timeout.
     fn drain(&self, deadline: Instant) -> Result<DrainReport>;
 
     /// Per shard: flush, write footer, fsync, close the active file. Release
     /// the data-dir flock immediately on success (the library does this for
     /// you by dropping its `DataDirLock` — your `seal` need only flush state).
+    ///
+    /// May take as long as the consumer needs. While `seal` is running, the
+    /// library emits heartbeats on the control socket so the supervisor's
+    /// liveness clock stays fresh; only the overall `SpawnSpec::deadline`
+    /// (default 5 minutes) caps the wall-clock duration.
     fn seal(&self) -> Result<SealReport>;
 
     /// Restart the accept loop after an aborted handoff. Called by the library

@@ -111,9 +111,26 @@ fn run() -> Result<ExitCode> {
                 "HANDOFF_SEAL_FAILS_ONCE".into(),
                 std::env::var("HANDOFF_SEAL_FAILS_ONCE").unwrap_or_default(),
             ),
+            // Forward the artificial delay knobs so a successor that
+            // becomes the next incumbent inherits the same slow-seal
+            // behavior (the slow-seal stress test handoffs in a chain).
+            (
+                "HANDOFF_SEAL_DELAY_MS".into(),
+                std::env::var("HANDOFF_SEAL_DELAY_MS").unwrap_or_default(),
+            ),
+            (
+                "HANDOFF_DRAIN_DELAY_MS".into(),
+                std::env::var("HANDOFF_DRAIN_DELAY_MS").unwrap_or_default(),
+            ),
         ],
-        deadline: Duration::from_secs(30),
-        drain_grace: Duration::from_secs(10),
+        // Test-fixture deadlines: generous enough for the slow-seal
+        // test (which sleeps up to 15s in `seal()`) but bounded so a
+        // genuine hang fails the test rather than waiting for the
+        // library defaults (5 minutes).
+        deadline: Duration::from_secs(parse_secs_env("HANDOFF_TEST_DEADLINE_SECS").unwrap_or(60)),
+        drain_grace: Duration::from_secs(
+            parse_secs_env("HANDOFF_TEST_DRAIN_GRACE_SECS").unwrap_or(30),
+        ),
     };
 
     let outcome = sup.perform_handoff(spec).context("perform_handoff")?;
@@ -137,4 +154,8 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn parse_secs_env(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|s| s.parse().ok())
 }

@@ -14,6 +14,8 @@
 use std::io::ErrorKind;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::crash::points;
@@ -24,15 +26,153 @@ use crate::frame::{read_message, write_message};
 use crate::lock::DataDirLock;
 use crate::metrics::events;
 use crate::protocol::{
-    Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, Side, negotiate_version, short_name,
+    Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version,
+    short_name,
 };
 use crate::util::now_unix_ms;
+
+/// How long the session-error recovery path will wait for the data-dir
+/// flock to become acquirable. Covers the brief race where a successor
+/// took the flock after `SealComplete`, then could not complete the
+/// handshake (e.g. the supervisor died after sending `Begin`), and is now
+/// exiting — kernel-releasing the flock in the process. A few seconds is
+/// far longer than that exit takes; if it's still held after this, the
+/// holder is a legitimately-installed new incumbent and we should exit.
+const RESUME_FLOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cadence of heartbeats emitted while the incumbent is blocked in a
+/// long-running consumer hook (`drain` or `seal`). With the supervisor's
+/// `LIVENESS_TIMEOUT` set to 10s, 2s gives us a 5× safety margin against
+/// scheduler hiccups before the supervisor would declare the peer dead.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Bound on the `HelloAck` read after a peer connects to the control
+/// socket. A well-behaved supervisor writes `HelloAck` immediately after
+/// reading our `Hello`, so this should be near-instant — generous slack
+/// still bounds the case where a peer connects, stalls, and would
+/// otherwise pin the single-session serve loop indefinitely.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Incumbent {
     listener: UnixListener,
     lock: Option<DataDirLock>,
     data_dir: PathBuf,
     build_id: Vec<u8>,
+}
+
+/// Run `work` on the current thread while a background thread emits
+/// `Heartbeat` frames on `stream` every [`HEARTBEAT_INTERVAL`]. The
+/// heartbeats let a long-running but progressing consumer hook (`drain`,
+/// `seal`) complete without tripping the supervisor's per-recv liveness
+/// timeout.
+///
+/// Concurrency contract: while `work` is executing on the main thread,
+/// only the heartbeat thread writes to `stream`; the main thread is busy
+/// inside the consumer's code and never reads or writes the socket. On
+/// return (or panic) the heartbeat thread is signaled to stop and joined
+/// before the helper returns control, so the main thread is the sole
+/// writer again by the time it sends `Drained`/`SealComplete`.
+///
+/// A failure to clone the stream for the heartbeat thread is non-fatal:
+/// we log a warning and run `work` without heartbeats. The supervisor's
+/// liveness timeout would then bound the operation in wall-clock terms.
+fn run_with_heartbeats<F, T>(stream: &UnixStream, chosen: ProtoVersion, work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not clone control stream for heartbeats; running without"
+            );
+            return work();
+        }
+    };
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let hb_thread = thread::spawn(move || {
+        let mut writer = writer;
+        // `recv_timeout` returns Err on timeout — that's our "no stop
+        // signal yet, send another heartbeat" trigger. `Ok(())` means
+        // the main thread asked us to stop; any other Err means the
+        // sender dropped (also a stop signal).
+        while stop_rx.recv_timeout(HEARTBEAT_INTERVAL).is_err() {
+            let msg = Message::Heartbeat {
+                ts_ms: now_unix_ms(),
+            };
+            if write_message(&mut writer, chosen, &msg).is_err() {
+                // Supervisor gone or socket broken — no point continuing.
+                return;
+            }
+        }
+    });
+
+    // RAII guard: signal + join the heartbeat thread on every exit path,
+    // including a panic inside `work`. After this drops, the heartbeat
+    // thread has fully exited and the main thread is the sole writer.
+    struct StopGuard {
+        stop_tx: Option<mpsc::Sender<()>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for StopGuard {
+        fn drop(&mut self) {
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(h) = self.thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = StopGuard {
+        stop_tx: Some(stop_tx),
+        thread: Some(hb_thread),
+    };
+
+    work()
+}
+
+/// Bind the control socket, unlinking any prior path binding first.
+/// Shared by `Incumbent::bind_cold_start` (no prior incumbent to displace)
+/// and `Incumbent::bind_after_ready` (called from a successor immediately
+/// after `Ready` so the prior incumbent is committed and exiting). The
+/// preconditions are caller-enforced; this routine assumes the unlink is
+/// safe at the call site.
+fn bind_unlinking(socket_path: &Path, lock: DataDirLock) -> Result<Incumbent> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Remove any stale (cold start) or about-to-be-orphaned (after-ready)
+    // socket file. The caller has established that no live peer is
+    // serving on this path.
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    let data_dir = lock.data_dir().to_path_buf();
+    Ok(Incumbent {
+        listener,
+        lock: Some(lock),
+        data_dir,
+        build_id: Vec::new(),
+    })
+}
+
+/// Acquire the data-dir flock, retrying briefly on `LockHeld` so a
+/// transiently-held lock (a dying successor) does not surface as a fatal
+/// error in the session-error recovery path. Any other error is returned
+/// immediately — only `LockHeld` triggers a retry.
+fn acquire_with_short_retry(data_dir: &Path, timeout: Duration) -> Result<DataDirLock> {
+    const RETRY_INTERVAL: Duration = Duration::from_millis(25);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match DataDirLock::acquire(data_dir) {
+            Ok(lock) => return Ok(lock),
+            Err(Error::LockHeld { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// What happened to one supervisor session.
@@ -75,19 +215,20 @@ impl Incumbent {
     /// [`Successor::announce_and_bind`], which orders `Ready` and bind in
     /// one call.
     pub fn bind_cold_start(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Remove any stale socket file left by a crashed predecessor.
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path)?;
-        let data_dir = lock.data_dir().to_path_buf();
-        Ok(Self {
-            listener,
-            lock: Some(lock),
-            data_dir,
-            build_id: Vec::new(),
-        })
+        bind_unlinking(socket_path, lock)
+    }
+
+    /// Successor-side bind, called by [`crate::BegunSuccessor::announce_and_bind`]
+    /// immediately after `Ready` has been sent. The supervisor has by then
+    /// disarmed its `ChildGuard` and committed `O`, so unlinking the prior
+    /// incumbent's path binding is safe — the prior incumbent is exiting
+    /// and will not re-bind.
+    ///
+    /// Shares its implementation with [`Self::bind_cold_start`]; the
+    /// separate entry point exists so callers see a name that reflects the
+    /// preconditions appropriate to their context.
+    pub(crate) fn bind_after_ready(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
+        bind_unlinking(socket_path, lock)
     }
 
     /// Set the implementation-defined build identifier announced in `Hello`.
@@ -114,7 +255,7 @@ impl Incumbent {
                     tracing::error!(error = %e, "handoff session ended with error");
                     // If we sealed but didn't commit, try to resume so we keep serving.
                     if self.lock.is_none() {
-                        match DataDirLock::acquire(&self.data_dir) {
+                        match acquire_with_short_retry(&self.data_dir, RESUME_FLOCK_TIMEOUT) {
                             Ok(lock) => {
                                 self.lock = Some(lock);
                                 if let Err(e2) = drainable.resume_after_abort() {
@@ -161,8 +302,22 @@ impl Incumbent {
         };
         write_message(&mut stream, PROTO_MAX, &our_hello)?;
 
-        // Receive HelloAck.
-        let (_v, ack) = read_message(&mut stream)?;
+        // Receive HelloAck. Bound the read so a peer that connected and then
+        // stalled without responding can't pin the serve loop. `serve()`
+        // accepts one session at a time, so a single stuck peer would
+        // otherwise block every legitimate handoff.
+        stream.set_read_timeout(Some(HELLO_READ_TIMEOUT))?;
+        let read_result = read_message(&mut stream);
+        let _ = stream.set_read_timeout(None);
+        let (_v, ack) = match read_result {
+            Ok(x) => x,
+            Err(Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                return Err(Error::Timeout("HelloAck"));
+            }
+            Err(e) => return Err(e),
+        };
         let chosen = match ack {
             Message::HelloAck {
                 proto_version_chosen,
@@ -244,7 +399,13 @@ impl Incumbent {
                         target: events::PREPARE,
                         %handoff_id, "drain start"
                     );
-                    let report = drainable.drain(deadline)?;
+                    // Heartbeats during drain: the consumer's `drain` may
+                    // block for many seconds (drain in-flight requests,
+                    // fsync, …). A background thread emits Heartbeat
+                    // frames so the supervisor's liveness timer stays
+                    // fresh; without this, slow-but-progressing drains
+                    // would trip the supervisor's per-recv timeout.
+                    let report = run_with_heartbeats(stream, chosen, || drainable.drain(deadline))?;
                     state.drained = true;
                     tracing::info!(
                         target: events::DRAINED,
@@ -269,7 +430,14 @@ impl Incumbent {
                         target: events::SEAL,
                         %handoff_id, "seal start"
                     );
-                    match drainable.seal() {
+                    // Heartbeats during seal: the consumer's `seal` is
+                    // commonly the longest hook in a handoff (flush, fsync,
+                    // footer-write per shard). A background thread emits
+                    // Heartbeat frames so the supervisor's liveness timer
+                    // doesn't trip just because seal is slow — only if O
+                    // becomes genuinely unresponsive.
+                    let seal_outcome = run_with_heartbeats(stream, chosen, || drainable.seal());
+                    match seal_outcome {
                         Ok(report) => {
                             // Release the flock immediately on seal success — N
                             // will acquire it. We continue serving reads until Commit.
@@ -387,4 +555,3 @@ impl Incumbent {
         }
     }
 }
-

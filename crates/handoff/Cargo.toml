@@ -33,5 +33,6 @@ default = []
 crash-points = []
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

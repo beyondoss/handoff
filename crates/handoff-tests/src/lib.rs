@@ -140,6 +140,8 @@ impl Fixture {
             fixture: self,
             crash_at: None,
             seal_fails: false,
+            seal_delay_ms: 0,
+            drain_delay_ms: 0,
         }
     }
 
@@ -260,6 +262,8 @@ pub struct PrimitiveBuilder<'a> {
     fixture: &'a Fixture,
     crash_at: Option<&'static str>,
     seal_fails: bool,
+    seal_delay_ms: u64,
+    drain_delay_ms: u64,
 }
 
 impl PrimitiveBuilder<'_> {
@@ -274,6 +278,20 @@ impl PrimitiveBuilder<'_> {
     /// next request. Resets after firing once.
     pub fn seal_fails_once(mut self) -> Self {
         self.seal_fails = true;
+        self
+    }
+
+    /// Sleep this long inside `Drainable::seal` before returning success.
+    /// Used by the slow-seal test to verify that heartbeats keep the
+    /// supervisor's liveness clock fresh during long consumer hooks.
+    pub fn seal_delay(mut self, delay: Duration) -> Self {
+        self.seal_delay_ms = delay.as_millis() as u64;
+        self
+    }
+
+    /// Sleep this long inside `Drainable::drain` before returning success.
+    pub fn drain_delay(mut self, delay: Duration) -> Self {
+        self.drain_delay_ms = delay.as_millis() as u64;
         self
     }
 
@@ -293,6 +311,8 @@ impl PrimitiveBuilder<'_> {
                 "HANDOFF_SEAL_FAILS_ONCE",
                 if self.seal_fails { "1" } else { "0" },
             )
+            .env("HANDOFF_SEAL_DELAY_MS", self.seal_delay_ms.to_string())
+            .env("HANDOFF_DRAIN_DELAY_MS", self.drain_delay_ms.to_string())
             .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_default())
             .stdin(Stdio::null())
             .stdout(open_log(&log_path))

@@ -79,9 +79,22 @@ impl DataDirLock {
         })
     }
 
-    /// Like [`acquire`], but if the lock is held by a PID that's no longer
-    /// alive (kernel released the flock on death; only the pidfile remained),
-    /// reclaim the lock. Refuses to break a lock held by a live process.
+    /// Like [`Self::acquire`], but if the lock appears stale (pidfile names
+    /// a PID that's no longer alive), reclaim it. Refuses to break a lock
+    /// held by a live named holder.
+    ///
+    /// Strategy: re-attempt `Self::acquire` on the existing lockfile inode.
+    /// When the named holder really has died, the kernel released its flock
+    /// and the second attempt succeeds. When something else is genuinely
+    /// holding the flock — an inherited FD outliving the named holder, or a
+    /// PID-reuse race that briefly makes the pidfile lie — the second
+    /// attempt still returns `LockHeld` and we surface
+    /// [`Error::StaleLockBreakRefused`].
+    ///
+    /// We deliberately do NOT unlink the lockfile and acquire on a fresh
+    /// inode: that path can leave two processes each holding "the lock" on
+    /// separate inodes if the original inode's flock is still held,
+    /// violating invariant #1 (at most one process holds the writer lock).
     pub fn acquire_or_break_stale(data_dir: &Path) -> Result<Self> {
         match Self::acquire(data_dir) {
             Ok(lock) => Ok(lock),
@@ -89,14 +102,17 @@ impl DataDirLock {
                 if holder_pid != 0 && is_pid_alive(holder_pid) {
                     return Err(Error::StaleLockBreakRefused { holder_pid });
                 }
-                tracing::warn!(holder_pid, "breaking stale handoff data-dir lock");
-                // The flock attached to the existing lockfile's inode is held
-                // by the dead process's still-open kernel struct sock_t — but
-                // since the process is gone, the kernel has released it. We
-                // remove the on-disk artifacts and acquire fresh.
-                let _ = std::fs::remove_file(data_dir.join(PID_FILE));
-                let _ = std::fs::remove_file(data_dir.join(LOCK_FILE));
-                Self::acquire(data_dir)
+                tracing::warn!(
+                    holder_pid,
+                    "data-dir flock appears stale (named holder dead); retrying acquire"
+                );
+                match Self::acquire(data_dir) {
+                    Ok(lock) => Ok(lock),
+                    Err(Error::LockHeld { holder_pid }) => {
+                        Err(Error::StaleLockBreakRefused { holder_pid })
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -128,6 +144,18 @@ fn write_pid_atomic(path: &Path, pid: u32) -> Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename's link-update is durable.
+    // The pidfile is advisory (flock is authoritative), but a stale or
+    // missing pidfile after crash recovery defeats `acquire_or_break_stale`'s
+    // ability to identify the prior holder.
+    if let Some(parent) = path.parent() {
+        let target = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        File::open(target)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -185,14 +213,28 @@ mod tests {
     }
 
     #[test]
-    fn stale_break_clears_dead_pid_lock() {
+    fn stale_break_succeeds_when_kernel_released_flock() {
+        // Crashed prior holder: lockfile + pidfile on disk, flock NOT
+        // currently held (the kernel released it when the PID died).
+        // `i32::MAX` is above pid_max on Linux, so `kill(MAX, 0)` returns
+        // ESRCH and the pidfile is unambiguously stale.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LOCK_FILE), b"").unwrap();
+        std::fs::write(dir.path().join(PID_FILE), format!("{}", i32::MAX)).unwrap();
+
+        let _new_lock = DataDirLock::acquire_or_break_stale(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn stale_break_refuses_when_pidfile_lies_but_flock_held() {
+        // The pidfile names a dead PID, but someone is genuinely holding
+        // the flock right now (inherited FD, or a brief PID-reuse race).
+        // Safer to refuse than to unlink the lockfile and produce two
+        // parallel-inode flocks that would split-brain invariant #1.
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
         let pid_path = dir.path().join(PID_FILE);
 
-        // Take the flock on a separate FD with a definitely-dead PID in the
-        // pidfile. `i32::MAX` is above any practical pid_max on Linux, so
-        // `kill(MAX, 0)` returns ESRCH.
         let f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -205,13 +247,12 @@ mod tests {
             .unwrap();
         std::fs::write(&pid_path, format!("{}", i32::MAX)).unwrap();
 
-        // Stale-break should detect the dead PID, unlink the artifacts (which
-        // doesn't release `_other_flock` since its inode lives on, but creates
-        // a fresh inode for the new acquire), and succeed.
-        let _new_lock = DataDirLock::acquire_or_break_stale(dir.path()).unwrap();
-
-        // Make sure the original flock holder is alive so the test is honest
-        // about "kernel keeps the original flock until process exit" semantics.
+        match DataDirLock::acquire_or_break_stale(dir.path()) {
+            Err(Error::StaleLockBreakRefused { .. }) => {}
+            other => panic!("expected StaleLockBreakRefused, got {other:?}"),
+        }
+        // Keep the flock alive through the assertion so the test models
+        // a genuinely-held flock, not a transient one.
         assert!(_other_flock.as_raw_fd() >= 0);
     }
 }

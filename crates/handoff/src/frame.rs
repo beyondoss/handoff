@@ -146,4 +146,171 @@ mod tests {
             Err(Error::FrameMalformed(_))
         ));
     }
+
+    #[test]
+    fn rejects_frame_exactly_at_max_plus_one() {
+        // frame_len = MAX_FRAME_BYTES + 1 must be rejected; the exact
+        // boundary case verifies the comparator is `>` not `>=`.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_le_bytes());
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            read_message(&mut cursor),
+            Err(Error::FrameTooLarge(n)) if n == MAX_FRAME_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn truncated_frame_after_len_is_err_not_panic() {
+        // Length prefix says "more bytes coming" but stream EOFs.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&128u32.to_le_bytes());
+        let mut cursor = Cursor::new(buf);
+        // Must return Err (UnexpectedEof) without panicking.
+        assert!(read_message(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn truncated_frame_after_version_is_err_not_panic() {
+        // Length prefix + version field, but payload missing.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&128u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        let mut cursor = Cursor::new(buf);
+        assert!(read_message(&mut cursor).is_err());
+    }
+
+    proptest::proptest! {
+        /// Pure fuzz: `read_message` must never panic on any input bytes,
+        /// regardless of length, content, or alignment. The legal outcomes
+        /// are `Ok(_)` (if the bytes happen to encode a valid frame) or
+        /// `Err(_)` of any variant.
+        #[test]
+        fn read_message_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
+        ) {
+            let mut cursor = Cursor::new(bytes);
+            let _ = read_message(&mut cursor);
+        }
+
+        /// Length prefix is honest: if we declare `frame_len = N` and feed
+        /// exactly N bytes after the prefix, the reader either decodes a
+        /// valid message or returns Err — never blocks, never panics.
+        #[test]
+        fn declared_length_is_honored(
+            declared in 0u32..=(MAX_FRAME_BYTES + 1),
+            body in proptest::collection::vec(proptest::num::u8::ANY, 0..(MAX_FRAME_BYTES as usize + 4)),
+        ) {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&declared.to_le_bytes());
+            let take = (declared as usize).min(body.len());
+            buf.extend_from_slice(&body[..take]);
+            let mut cursor = Cursor::new(buf);
+            let _ = read_message(&mut cursor);
+        }
+
+        /// Roundtrip property over every `Message` variant the codec
+        /// supports: encode, decode, encode again — the two encodings must
+        /// be byte-identical (i.e. encoding is deterministic for a given
+        /// logical value). Variant payloads come from arbitrary inputs so
+        /// e.g. odd `Vec<u64>` lengths, empty `build_id`, etc. are covered.
+        #[test]
+        fn roundtrip_all_variants(msg in arb_message()) {
+            let mut buf = Vec::new();
+            write_message(&mut buf, PROTO_MAX, &msg).expect("encode");
+            let mut cursor = Cursor::new(buf.clone());
+            let (ver, decoded) = read_message(&mut cursor).expect("decode");
+            proptest::prop_assert_eq!(ver, PROTO_MAX);
+            // Re-encode and compare bytes — the simplest stable equality
+            // check that doesn't require `Message: PartialEq`.
+            let mut buf2 = Vec::new();
+            write_message(&mut buf2, PROTO_MAX, &decoded).expect("re-encode");
+            proptest::prop_assert_eq!(buf, buf2);
+        }
+    }
+
+    /// Strategy that emits every `Message` variant with arbitrary payloads.
+    /// Kept inline in the test module because the protocol type isn't
+    /// `Arbitrary`-derived (which would force the dep into prod).
+    fn arb_message() -> impl proptest::strategy::Strategy<Value = Message> {
+        use proptest::prelude::*;
+        let side = prop_oneof![Just(Side::Incumbent), Just(Side::Successor)];
+        let handoff_id = any::<[u8; 16]>().prop_map(|b| HandoffId(uuid::Uuid::from_bytes(b)));
+        let build_id = prop::collection::vec(any::<u8>(), 0..64);
+        let revisions = prop::collection::vec(any::<u64>(), 0..16);
+        let fingerprint = any::<[u8; 32]>();
+        let listening_on = prop::collection::vec("[a-z]{1,8}", 0..4);
+        let reason = "[a-zA-Z0-9 _-]{0,64}";
+
+        prop_oneof![
+            (side, any::<u32>(), build_id.clone()).prop_map(|(role, pid, build_id)| {
+                Message::Hello {
+                    role,
+                    pid,
+                    build_id,
+                    proto_min: PROTO_MIN,
+                    proto_max: PROTO_MAX,
+                    capabilities: Capabilities::default(),
+                }
+            }),
+            (handoff_id.clone()).prop_map(|id| Message::HelloAck {
+                proto_version_chosen: PROTO_MAX,
+                handoff_id: id,
+            }),
+            (handoff_id.clone(), any::<u32>(), any::<u64>(), any::<u64>()).prop_map(
+                |(id, pid, dl, dg)| Message::PrepareHandoff {
+                    handoff_id: id,
+                    successor_pid: pid,
+                    deadline_ms: dl,
+                    drain_grace_ms: dg,
+                }
+            ),
+            (any::<u32>(), any::<bool>()).prop_map(|(n, c)| Message::Drained {
+                open_conns_remaining: n,
+                accept_closed: c,
+            }),
+            handoff_id
+                .clone()
+                .prop_map(|id| Message::SealRequest { handoff_id: id }),
+            (any::<u32>(), any::<u32>(), any::<u64>()).prop_map(|(s, t, r)| {
+                Message::SealProgress {
+                    shards_sealed: s,
+                    shards_total: t,
+                    last_revision: r,
+                }
+            }),
+            (handoff_id.clone(), revisions.clone(), fingerprint).prop_map(|(id, revs, fp)| {
+                Message::SealComplete {
+                    handoff_id: id,
+                    last_revision_per_shard: revs,
+                    data_dir_fingerprint: fp,
+                }
+            }),
+            (handoff_id.clone(), reason, reason).prop_map(|(id, e, p)| Message::SealFailed {
+                handoff_id: id,
+                error: e,
+                partial_state: p,
+            }),
+            handoff_id
+                .clone()
+                .prop_map(|id| Message::Begin { handoff_id: id }),
+            (handoff_id.clone(), listening_on, any::<bool>(), revisions).prop_map(
+                |(id, lo, hz, revs)| Message::Ready {
+                    handoff_id: id,
+                    listening_on: lo,
+                    healthz_ok: hz,
+                    advertised_revision_per_shard: revs,
+                }
+            ),
+            handoff_id
+                .clone()
+                .prop_map(|id| Message::Commit { handoff_id: id }),
+            (handoff_id.clone(), reason).prop_map(|(id, r)| Message::Abort {
+                handoff_id: id,
+                reason: r,
+            }),
+            handoff_id.prop_map(|id| Message::ResumeAfterAbort { handoff_id: id }),
+            any::<u64>().prop_map(|ts| Message::Heartbeat { ts_ms: ts }),
+        ]
+    }
 }
