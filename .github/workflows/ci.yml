@@ -22,7 +22,7 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (crash-points enabled)
-        run: cargo clippy -p handoff --features crash-points --all-targets -- -D warnings
+        run: cargo clippy -p beyond-handoff --features crash-points --all-targets -- -D warnings
 
   test:
     name: Test
