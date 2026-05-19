@@ -20,9 +20,13 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::marker::PhantomData;
 use std::net::TcpListener;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use crate::drainable::ReadinessSnapshot;
 use crate::error::{Error, Result};
@@ -30,6 +34,12 @@ use crate::frame::{read_message, write_message};
 use crate::protocol::{
     Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, short_name,
 };
+use crate::util::now_unix_ms;
+
+/// Cadence matched to the incumbent's heartbeat thread; with the
+/// supervisor's `LIVENESS_TIMEOUT` of 10s, 2s gives a 5× margin against
+/// scheduler hiccups before the supervisor would declare the successor dead.
+const SUCCESSOR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub const ENV_HANDOFF_ROLE: &str = "HANDOFF_ROLE";
 pub const ENV_HANDOFF_SOCK_FD: &str = "HANDOFF_SOCK_FD";
@@ -325,6 +335,94 @@ impl BegunSuccessor {
     ) -> Result<crate::Incumbent> {
         self.announce_ready(snapshot)?;
         crate::Incumbent::bind_after_ready(socket_path, lock)
+    }
+
+    /// Spawn a background thread that emits `Heartbeat` frames on the
+    /// control socket every ~2s. The returned guard stops + joins the
+    /// thread on drop. Use this to keep the supervisor's per-recv
+    /// `LIVENESS_TIMEOUT` (10s) from tripping while the successor is
+    /// doing slow synchronous init work between `wait_for_begin` and
+    /// `announce_and_bind` — DB pool warm-up, state rebuild, TLS load,
+    /// etc. Mirrors the incumbent's existing heartbeat thread which
+    /// covers `drain` / `seal`.
+    ///
+    /// # Ordering contract
+    ///
+    /// **The guard must be dropped before `announce_ready` /
+    /// `announce_and_bind`.** While the guard is live, the heartbeat
+    /// thread is the sole writer to the control socket; interleaving
+    /// the main thread's `Ready` frame with a heartbeat would corrupt
+    /// the wire. The borrow of `&self` enforces this: the compiler
+    /// rejects any path that calls a consuming method while the guard
+    /// is still alive.
+    ///
+    /// # Failure mode
+    ///
+    /// On `try_clone` failure (rare; FD table exhausted) the returned
+    /// guard is inert — no thread spawned — and a warning is logged.
+    /// The supervisor's liveness timer then bounds init in wall-clock
+    /// terms exactly as before this API existed.
+    pub fn start_heartbeats(&self) -> HeartbeatGuard<'_> {
+        HeartbeatGuard::start(&self.control, self.proto_version)
+    }
+}
+
+/// RAII handle for a successor-side heartbeat thread. See
+/// [`BegunSuccessor::start_heartbeats`].
+pub struct HeartbeatGuard<'a> {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+    _borrow: PhantomData<&'a UnixStream>,
+}
+
+impl<'a> HeartbeatGuard<'a> {
+    fn start(stream: &'a UnixStream, chosen: ProtoVersion) -> Self {
+        let writer = match stream.try_clone() {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not clone control stream for successor heartbeats; running without"
+                );
+                return Self {
+                    stop_tx: None,
+                    thread: None,
+                    _borrow: PhantomData,
+                };
+            }
+        };
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let thread = thread::spawn(move || {
+            let mut writer = writer;
+            // `recv_timeout` returns Err on timeout — "no stop yet, send
+            // another heartbeat". `Ok(())` or any other Err (sender
+            // dropped) is the stop signal.
+            while stop_rx.recv_timeout(SUCCESSOR_HEARTBEAT_INTERVAL).is_err() {
+                let msg = Message::Heartbeat {
+                    ts_ms: now_unix_ms(),
+                };
+                if write_message(&mut writer, chosen, &msg).is_err() {
+                    // Supervisor gone or socket broken — no point continuing.
+                    return;
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl Drop for HeartbeatGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
     }
 }
 

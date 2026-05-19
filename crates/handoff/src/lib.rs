@@ -33,6 +33,7 @@ pub use incumbent::Incumbent;
 pub use lock::DataDirLock;
 pub use protocol::HandoffId;
 pub use role::{
-    BegunSuccessor, HandshookSuccessor, InheritedListeners, Role, Successor, detect_role,
+    BegunSuccessor, HandshookSuccessor, HeartbeatGuard, InheritedListeners, Role, Successor,
+    detect_role,
 };
 pub use supervisor::{HandoffOutcome, SpawnSpec, Supervisor};
