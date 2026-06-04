@@ -264,7 +264,7 @@ If `ChildGuard` were still armed when the `Commit` write failed (e.g. O crashed 
 
 ### Why the state journal uses rename, not O_DSYNC write
 
-`write tmp + rename` produces an atomic view: the on-disk file is always either the old complete state or the new complete state, never a partial write. `O_DSYNC` only ensures the write itself is durable — it doesn't prevent a torn record if the supervisor crashes mid-write. Rename on Linux ext4/XFS/btrfs is atomic with respect to crash consistency.
+`write tmp + rename` produces an atomic view: the on-disk file is always either the old complete state or the new complete state, never a partial write. `O_DSYNC` only ensures the write itself is durable — it doesn't prevent a torn record if the supervisor crashes mid-write. `rename(2)` is atomic with respect to crash consistency on every supported filesystem — Linux ext4/XFS/btrfs, macOS APFS, and BSD UFS/ZFS — so the guarantee is not Linux-specific.
 
 ### Liveness: heartbeats during drain/seal + two-tier supervisor timeout
 

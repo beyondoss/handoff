@@ -150,11 +150,15 @@ mod tests {
         use std::os::fd::IntoRawFd;
 
         let mk = || {
+            // `SockFlag::empty()` (not SOCK_CLOEXEC): these are throwaway
+            // source FDs for the dup2-shuffle assertion, and the flag isn't
+            // defined on macOS — keeping it portable lets the test compile
+            // everywhere.
             let (a, b) = socketpair(
                 AddressFamily::Unix,
                 SockType::Stream,
                 None,
-                SockFlag::SOCK_CLOEXEC,
+                SockFlag::empty(),
             )
             .unwrap();
             (a.into_raw_fd(), b.into_raw_fd())

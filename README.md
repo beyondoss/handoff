@@ -15,6 +15,10 @@ Three roles: a **supervisor** that holds listener FDs and drives the swap, an **
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the wire protocol, state machine, and correctness invariants.
 
+## Platforms
+
+Linux, macOS, and the BSDs. The mechanism is plain POSIX — `fork`/`exec` FD inheritance, `flock`, Unix-domain control sockets, and signals — with no Linux-only syscalls. Windows is unsupported: it has no `fork`/`exec` FD inheritance and no `flock`, so the handoff model doesn't map without a separate backend.
+
 ## Integrate your daemon
 
 ### 1. Implement `Drainable`

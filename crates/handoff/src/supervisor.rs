@@ -775,12 +775,35 @@ fn send_best_effort_abort(
 }
 
 fn make_socketpair() -> Result<(UnixStream, UnixStream)> {
+    // Linux and the BSDs create the pair close-on-exec atomically via the
+    // SOCK_CLOEXEC flag. macOS doesn't define that flag for socketpair (nix
+    // won't even compile the symbol there), so set FD_CLOEXEC with a
+    // follow-up fcntl on each end. The non-atomic window on macOS is
+    // theoretical: this runs on the rare swap path, not under a fork storm.
+    #[cfg(not(target_os = "macos"))]
     let (a, b) = socketpair(
         AddressFamily::Unix,
         SockType::Stream,
         None,
         SockFlag::SOCK_CLOEXEC,
     )?;
+    #[cfg(target_os = "macos")]
+    let (a, b) = {
+        use std::os::fd::AsFd;
+        let pair = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )?;
+        for fd in [pair.0.as_fd(), pair.1.as_fd()] {
+            nix::fcntl::fcntl(
+                fd,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )?;
+        }
+        pair
+    };
     // SAFETY: both ends are freshly owned by us, valid, non-blocking unset.
     let s_a = unsafe {
         use std::os::fd::FromRawFd;

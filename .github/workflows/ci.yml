@@ -37,6 +37,38 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    needs: check
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + integration tests
+        # Exercises the macOS-specific paths that cross-compilation can't:
+        # the `fcntl(FD_CLOEXEC)` fallback for socketpair (no SOCK_CLOEXEC
+        # on macOS) and the `/dev/fd` FD-leak enumeration.
+        run: cargo test --workspace --lib --tests
+      - name: Stress test (FD stability)
+        run: cargo test -p handoff-tests --test stress
+
+  cross-check:
+    name: Cross-compile (FreeBSD)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+      - uses: Swatinem/rust-cache@v2
+      - name: Type-check BSD target
+        # GitHub has no free FreeBSD runner; `cargo check` proves the BSD
+        # path stays buildable without one (type-check only, no linking).
+        run: cargo check --workspace --all-targets --target x86_64-unknown-freebsd
+
   crash-matrix:
     name: Crash matrix (fault injection)
     runs-on: ubuntu-latest
