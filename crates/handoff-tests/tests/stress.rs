@@ -61,13 +61,14 @@ fn many_handoffs_no_resource_leaks() {
     );
 }
 
-/// Count of open file descriptors in the test process. Reads
-/// `/proc/self/fd` directly so it captures everything — not just FDs we
-/// know about. The directory entry for `/proc/self/fd` itself opens an
-/// FD during enumeration; we measure with the same method on both sides
-/// so the bias cancels.
+/// Count of open file descriptors in the test process. Reads `/dev/fd`
+/// directly so it captures everything — not just FDs we know about.
+/// `/dev/fd` is the portable spelling of the per-process FD directory: a
+/// symlink to `/proc/self/fd` on Linux, a real fdescfs on macOS and
+/// FreeBSD. The directory entry itself opens an FD during enumeration; we
+/// measure with the same method on both sides so the bias cancels.
 fn count_open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .expect("Linux: /proc/self/fd should exist")
+    std::fs::read_dir("/dev/fd")
+        .expect("/dev/fd should exist on any supported Unix")
         .count()
 }
