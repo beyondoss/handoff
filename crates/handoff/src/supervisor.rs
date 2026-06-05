@@ -371,7 +371,7 @@ impl Supervisor {
             }
             let remaining = seal_read_deadline - now;
             let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
-            o_stream.set_read_timeout(Some(recv_timeout))?;
+            arm_recv_timeout(&o_stream, recv_timeout)?;
             match read_message(&mut o_stream) {
                 Ok((_, Message::SealProgress { .. })) => continue,
                 Ok((_, Message::Heartbeat { .. })) => continue,
@@ -652,7 +652,7 @@ impl Supervisor {
         // Bound the initial Hello so a peer that accepted the connection but
         // hangs before writing can't block `perform_handoff` indefinitely.
         // Cleared after the read regardless of outcome.
-        stream.set_read_timeout(Some(HELLO_READ_TIMEOUT))?;
+        arm_recv_timeout(stream, HELLO_READ_TIMEOUT)?;
         let read_result = read_message(stream);
         let _ = stream.set_read_timeout(None);
         let (_v, peer_hello) = match read_result {
@@ -857,7 +857,7 @@ where
         // successful frame — heartbeat or otherwise — resets this on
         // the next iteration.
         let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
-        stream.set_read_timeout(Some(recv_timeout))?;
+        arm_recv_timeout(stream, recv_timeout)?;
         match read_message(stream) {
             Ok((_, Message::Heartbeat { .. })) => continue,
             Ok((_, Message::SealProgress { .. })) => continue,
@@ -879,6 +879,54 @@ where
             }
         }
     }
+}
+
+/// Arm the per-recv read timeout on `stream`, tolerating the macOS/BSD quirk
+/// where the peer has closed mid-handshake.
+///
+/// We bound each socket read with `SO_RCVTIMEO` (via `set_read_timeout`) so a
+/// silent peer can't wedge the handoff. On Linux this always succeeds. On
+/// macOS and the BSDs, `setsockopt` returns `EINVAL` for *any* option once the
+/// socket is fully shut down (`SS_CANTRCVMORE | SS_CANTSENDMORE`) — which is
+/// exactly what a peer that closed its end leaves behind. That `EINVAL` is not
+/// a real error: the peer is gone, so the read can no longer block. We must
+/// still perform the read, because a peer that sent a complete frame and then
+/// exited leaves that frame buffered (observed: a full `Ready` sitting in the
+/// receive buffer behind a shut-down socket) — dropping it would abort a
+/// handoff the successor actually completed.
+///
+/// So on `EINVAL` we confirm the read cannot block (a non-blocking peek shows
+/// EOF or buffered data) and return `Ok(())` *without* an armed timeout; the
+/// caller's `read_message` then drains any buffered frame and otherwise sees
+/// EOF, taking the same path it would on Linux. If the peek shows the socket
+/// is still open and empty (a genuine `EINVAL` we can't explain away), we
+/// surface the error rather than risk an unbounded blocking read.
+fn arm_recv_timeout(stream: &UnixStream, recv_timeout: Duration) -> Result<()> {
+    match stream.set_read_timeout(Some(recv_timeout)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && !read_would_block(stream) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Non-blocking peek: `true` only if a read right now would block (socket open,
+/// no buffered data, not at EOF). A closed peer (EOF, returns 0) or buffered
+/// bytes (returns > 0) both mean a blocking read makes immediate progress, so
+/// we report `false`. Any other peek error also means the read won't block (it
+/// will surface that error promptly), so likewise `false`.
+fn read_would_block(stream: &UnixStream) -> bool {
+    let mut byte = [0u8; 1];
+    // SAFETY: `recv` into a valid 1-byte buffer on a borrowed-but-live fd.
+    // MSG_PEEK leaves any bytes queued; MSG_DONTWAIT keeps this non-blocking.
+    let ret = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            byte.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    ret < 0 && std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock
 }
 
 fn remaining_until(deadline: Instant) -> Duration {

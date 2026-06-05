@@ -74,9 +74,11 @@ fn supervisor_crashes_after_spawn_successor() {
     exit.assert_crashed_at(&fx, points::S_AFTER_SPAWN_SUCCESSOR);
 
     assert!(primitive.alive(), "O survives S crash post-spawn");
-    // N was spawned and wrote its pid marker before attempting handshake.
+    // N was spawned and writes its pid marker before attempting handshake.
+    // N starts up asynchronously to S's crash, so wait briefly for the
+    // marker rather than racing N's first action against S's exit.
     assert!(
-        read_marker_value(&fx.markers, "successor-pid").is_some(),
+        fx.wait_marker("successor-pid", Duration::from_secs(3)),
         "N must have written successor-pid before handshake"
     );
     // handshake either never completed (write to dead socket) or N had not
@@ -186,7 +188,7 @@ fn supervisor_crashes_after_prepare_sent() {
     assert!(primitive.alive(), "incumbent must survive S crash pre-seal");
     assert!(fx.marker_exists("drain-called"));
     assert!(
-        fx.marker_exists("resume-called"),
+        fx.wait_marker("resume-called", Duration::from_secs(3)),
         "drained-without-seal cleanup should call resume_after_abort"
     );
 
@@ -221,7 +223,7 @@ fn supervisor_crashes_after_seal_complete_recv() {
     assert!(primitive.alive(), "O must survive S crash post-seal");
     assert!(fx.marker_exists("seal-called"));
     assert!(
-        fx.marker_exists("resume-called"),
+        fx.wait_marker("resume-called", Duration::from_secs(3)),
         "sealed-then-EOF should trigger resume_after_abort"
     );
 
@@ -352,7 +354,7 @@ fn supervisor_crashes_after_begin_sent_converges() {
         FlockState::Held { pid, alive: true } if pid as u32 == o_pid => {
             // Outcome B: O recovered.
             assert!(
-                fx.marker_exists("resume-called"),
+                fx.wait_marker("resume-called", Duration::from_secs(3)),
                 "O's recovery path must have run resume_after_abort"
             );
             // Journal could be either Sealing (S journaled it before
@@ -548,7 +550,7 @@ fn successor_crashes_after_handshake() {
 
     assert!(primitive.alive(), "O survives N crash post-handshake");
     assert!(
-        fx.marker_exists("resume-called"),
+        fx.wait_marker("resume-called", Duration::from_secs(3)),
         "O must be told to resume after N is killed"
     );
     match fx.flock_state() {
@@ -579,7 +581,7 @@ fn successor_crashes_after_begin() {
     assert!(!fx.marker_exists("successor-ready"));
 
     assert!(primitive.alive(), "O survives N crash after Begin");
-    assert!(fx.marker_exists("resume-called"));
+    assert!(fx.wait_marker("resume-called", Duration::from_secs(3)));
     match fx.flock_state() {
         FlockState::Held { pid, alive: true } => assert_eq!(pid as u32, o_pid),
         other => panic!("flock not held by live O after N crash + Resume: {other:?}"),
@@ -612,7 +614,7 @@ fn successor_crashes_before_ready() {
 
     // O is still alive; resume marker fired.
     assert!(primitive.alive(), "O should survive N crash");
-    assert!(fx.marker_exists("resume-called"));
+    assert!(fx.wait_marker("resume-called", Duration::from_secs(3)));
 
     // O holds the flock; journal cleared (supervisor returned cleanly).
     match fx.flock_state() {
@@ -645,7 +647,7 @@ fn incumbent_seal_failure_keeps_o_alive() {
     assert!(primitive.alive(), "O survives seal-failure abort");
     assert!(fx.marker_exists("seal-called"));
     assert!(
-        fx.marker_exists("resume-called"),
+        fx.wait_marker("resume-called", Duration::from_secs(3)),
         "seal_failure must trigger O's resume_after_abort"
     );
 
