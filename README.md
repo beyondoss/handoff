@@ -142,6 +142,12 @@ binary         = "/usr/local/bin/my-daemon"
 drain_grace_secs = 25
 deadline_secs    = 60
 
+# The trigger socket is bound 0600 and only accepts connections from the
+# supervisor's own uid or root; list any other uid that may trigger swaps.
+allowed_uids = []
+# A trigger client may only name a binary listed here (or `binary` above).
+allowed_binaries = ["/usr/local/bin/my-daemon-v2"]
+
 [[listeners]]
 name = "http"
 addr = "0.0.0.0:8080"
@@ -151,9 +157,12 @@ addr = "0.0.0.0:8080"
 # Start the supervisor (it cold-starts your daemon):
 handoff-supervisor --config handoff.toml
 
-# Later, trigger a swap to a new binary:
-echo "handoff /usr/local/bin/my-daemon-v2" | socat - UNIX-CONNECT:/run/my-daemon/handoff.trigger
+# Later, swap to a new build of the configured binary:
+echo "handoff" | socat - UNIX-CONNECT:/run/my-daemon/handoff.trigger
 # ok: handoff_id=... committed=true abort_reason=None
+
+# Or name a binary from `allowed_binaries`; anything else is refused:
+echo "handoff /usr/local/bin/my-daemon-v2" | socat - UNIX-CONNECT:/run/my-daemon/handoff.trigger
 ```
 
 ### Embedded in code

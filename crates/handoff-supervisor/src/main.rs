@@ -10,6 +10,11 @@
 //!    drive `handoff::Supervisor::perform_handoff` against the running
 //!    primitive's control socket.
 //!
+//! The trigger socket is a privileged control surface: a command on it makes
+//! the supervisor drain the daemon and exec a binary. It is bound `0600` and
+//! every client's peer uid is checked (see `allowed_uids`), and the binary a
+//! client may name is restricted to `binary` plus `allowed_binaries`.
+//!
 //! This binary is a demonstration of the library API and a convenience for
 //! local development and tests. Production embedders (`guest-agent`,
 //! `beyond-pg`) link `handoff` directly and integrate it with their own
@@ -17,11 +22,11 @@
 
 #![deny(unsafe_code)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,8 +36,18 @@ use clap::Parser;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use handoff::pass_listener_fds_on_spawn;
 use handoff::supervisor::{SpawnSpec, Supervisor};
+use handoff::{bind_socket, pass_listener_fds_on_spawn, peer_uid, peer_uid_is_allowed};
+
+/// Cap on how long a trigger client may take to send its command line, and
+/// on how long a reply write may block. The loop is single-threaded, so an
+/// unbounded read here is a denial of service against every future handoff:
+/// one client that connects and never writes wedges the supervisor forever.
+const TRIGGER_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on a trigger command line. Commands are a verb plus an optional path;
+/// anything longer is a client sending garbage, and reading it unbounded
+/// would let one connection grow the supervisor's memory without limit.
+const TRIGGER_MAX_LINE: u64 = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +75,18 @@ struct Config {
     listeners: Vec<ListenerConfig>,
     /// Local Unix socket the supervisor listens on for trigger commands.
     trigger_socket: PathBuf,
+    /// Additional uids allowed to issue trigger commands. The supervisor's
+    /// own uid and root are always allowed; every other peer is refused.
+    /// The socket is bound `0600`, so this only widens access when a
+    /// deployment deliberately relaxes the directory permissions too.
+    #[serde(default)]
+    allowed_uids: Vec<u32>,
+    /// Binaries a trigger client may name in `handoff <binary>`, in addition
+    /// to `binary`. A client-supplied path that is not in this set is
+    /// refused: the trigger would otherwise be a request to execute an
+    /// arbitrary file as the supervisor's user.
+    #[serde(default)]
+    allowed_binaries: Vec<PathBuf>,
     #[serde(default)]
     journal: Option<PathBuf>,
     #[serde(default = "default_drain_grace_secs")]
@@ -134,12 +161,10 @@ fn main() -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "resume_from_journal failed; continuing"),
     }
 
-    // Prepare the trigger socket.
-    let _ = std::fs::remove_file(&cfg.trigger_socket);
-    if let Some(parent) = cfg.trigger_socket.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let trigger = UnixListener::bind(&cfg.trigger_socket)
+    // Prepare the trigger socket. `bind_socket` publishes it 0600 and
+    // replaces any stale path atomically, so there is no window in which the
+    // trigger exists with umask-derived permissions.
+    let trigger = bind_socket(&cfg.trigger_socket)
         .with_context(|| format!("bind trigger socket {}", cfg.trigger_socket.display()))?;
 
     tracing::info!(
@@ -149,7 +174,9 @@ fn main() -> Result<()> {
         "supervisor running"
     );
 
-    // Trigger loop. One client at a time; commands are line-delimited.
+    // Trigger loop. One client at a time; commands are line-delimited. No
+    // failure below is allowed to escape: the supervisor outlives every
+    // client, so a bad connection logs and yields to the next one.
     for client in trigger.incoming() {
         let stream = match client {
             Ok(s) => s,
@@ -158,24 +185,55 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        let mut writer = stream.try_clone()?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        let Some(cmd) = read_trigger_command(&stream, &cfg) else {
             continue;
-        }
-        let cmd = line.trim();
-        match handle_trigger(cmd, &cfg, &sup, &current_child) {
-            Ok(reply) => {
-                let _ = writeln!(writer, "{reply}");
-            }
-            Err(e) => {
-                let _ = writeln!(writer, "err: {e}");
-            }
-        }
+        };
+        let reply = match handle_trigger(cmd.trim(), &cfg, &sup, &current_child) {
+            Ok(reply) => reply,
+            Err(e) => format!("err: {e}"),
+        };
+        let mut writer = &stream;
+        let _ = writeln!(writer, "{reply}");
     }
 
     Ok(())
+}
+
+/// Authenticate a trigger client and read its command line, or `None` if the
+/// connection should be dropped. Every I/O step is time-bounded so one
+/// misbehaving client cannot stall the single-threaded loop.
+fn read_trigger_command(stream: &UnixStream, cfg: &Config) -> Option<String> {
+    let uid = match peer_uid(stream) {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read trigger peer credentials; dropping");
+            return None;
+        }
+    };
+    if !peer_uid_is_allowed(uid, &cfg.allowed_uids) {
+        tracing::warn!(peer_uid = uid, "refusing trigger from unauthorized uid");
+        let mut writer = stream;
+        let _ = writeln!(writer, "err: not permitted");
+        return None;
+    }
+    if let Err(e) = stream
+        .set_read_timeout(Some(TRIGGER_IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(TRIGGER_IO_TIMEOUT)))
+    {
+        tracing::warn!(error = %e, "could not bound trigger client I/O; dropping");
+        return None;
+    }
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream.take(TRIGGER_MAX_LINE));
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line),
+        Err(e) => {
+            tracing::warn!(error = %e, peer_uid = uid, "trigger command read failed");
+            None
+        }
+    }
 }
 
 fn handle_trigger(
@@ -188,10 +246,10 @@ fn handle_trigger(
     let mut tokens = cmd.split_whitespace();
     match tokens.next() {
         Some("handoff") => {
-            let binary = tokens
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.binary.clone());
+            let binary = match tokens.next() {
+                Some(requested) => resolve_requested_binary(Path::new(requested), cfg)?,
+                None => cfg.binary.clone(),
+            };
             let spec = SpawnSpec {
                 binary,
                 args: cfg.args.clone(),
@@ -242,6 +300,33 @@ fn handle_trigger(
         Some(other) => Ok(format!("err: unknown command '{other}'")),
         None => Ok("err: empty command".to_string()),
     }
+}
+
+/// Map a client-supplied binary path onto the configured allowlist.
+///
+/// The trigger socket is reachable by a local user, and `perform_handoff`
+/// execs whatever path it is handed — so an unrestricted override is a
+/// "run this file as the supervisor's user" primitive. Paths are compared
+/// after canonicalization so `./foo`, `/srv/../srv/foo`, and a symlink to an
+/// allowed target are all recognized as the same file.
+fn resolve_requested_binary(requested: &Path, cfg: &Config) -> Result<PathBuf> {
+    let canonical = requested
+        .canonicalize()
+        .with_context(|| format!("resolve requested binary {}", requested.display()))?;
+    let permitted = std::iter::once(&cfg.binary)
+        .chain(cfg.allowed_binaries.iter())
+        .any(|allowed| {
+            allowed
+                .canonicalize()
+                .is_ok_and(|allowed| allowed == canonical)
+        });
+    if !permitted {
+        anyhow::bail!(
+            "binary {} is not in the configured allowlist (`binary` + `allowed_binaries`)",
+            requested.display()
+        );
+    }
+    Ok(canonical)
 }
 
 /// Poll-wait on a child up to `timeout`. Returns `Some(result)` if the

@@ -22,13 +22,14 @@ use crate::crash::points;
 use crate::crash_here;
 use crate::drainable::Drainable;
 use crate::error::{Error, Result};
-use crate::frame::{read_message, write_message};
+use crate::frame::{FrameAccumulator, write_frame};
 use crate::lock::DataDirLock;
 use crate::metrics::events;
 use crate::protocol::{
     Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version,
     short_name,
 };
+use crate::sock;
 use crate::util::now_unix_ms;
 
 /// How long the session-error recovery path will wait for the data-dir
@@ -52,6 +53,16 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// still bounds the case where a peer connects, stalls, and would
 /// otherwise pin the single-session serve loop indefinitely.
 const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First backoff after an accept failure caused by resource exhaustion, and
+/// the ceiling it doubles up to. Exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+/// `ENOMEM`) does not clear instantly and the pending connection stays in the
+/// backlog, so retrying immediately would spin a core at full tilt while the
+/// condition persists. Backing off costs a little latency on the (rare)
+/// handoff connection and leaves the CPU available to whatever has to release
+/// the descriptors.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 pub struct Incumbent {
     listener: UnixListener,
@@ -92,7 +103,6 @@ where
     };
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let hb_thread = thread::spawn(move || {
-        let mut writer = writer;
         // `recv_timeout` returns Err on timeout — that's our "no stop
         // signal yet, send another heartbeat" trigger. `Ok(())` means
         // the main thread asked us to stop; any other Err means the
@@ -101,7 +111,7 @@ where
             let msg = Message::Heartbeat {
                 ts_ms: now_unix_ms(),
             };
-            if write_message(&mut writer, chosen, &msg).is_err() {
+            if write_frame(&writer, chosen, &msg).is_err() {
                 // Supervisor gone or socket broken — no point continuing.
                 return;
             }
@@ -133,21 +143,19 @@ where
     work()
 }
 
-/// Bind the control socket, unlinking any prior path binding first.
+/// Bind the control socket, taking over the path from any prior binding.
 /// Shared by `Incumbent::bind_cold_start` (no prior incumbent to displace)
 /// and `Incumbent::bind_after_ready` (called from a successor immediately
 /// after `Ready` so the prior incumbent is committed and exiting). The
-/// preconditions are caller-enforced; this routine assumes the unlink is
-/// safe at the call site.
-fn bind_unlinking(socket_path: &Path, lock: DataDirLock) -> Result<Incumbent> {
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Remove any stale (cold start) or about-to-be-orphaned (after-ready)
-    // socket file. The caller has established that no live peer is
-    // serving on this path.
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
+/// preconditions are caller-enforced; this routine assumes displacing
+/// whatever holds the path is safe at the call site.
+fn bind_replacing(socket_path: &Path, lock: DataDirLock) -> Result<Incumbent> {
+    // Bind onto a staging name and `rename(2)` it into place. This replaces
+    // any stale (cold start) or about-to-be-orphaned (after-ready) binding
+    // without the window in which the path does not exist, and publishes the
+    // socket only once its mode is `0600`. The caller has established that no
+    // live peer is serving on this path.
+    let listener = sock::bind_socket(socket_path)?;
     let data_dir = lock.data_dir().to_path_buf();
     Ok(Incumbent {
         listener,
@@ -172,6 +180,45 @@ fn acquire_with_short_retry(data_dir: &Path, timeout: Duration) -> Result<DataDi
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// How the accept loop should react to an `accept(2)` failure.
+enum AcceptFailure {
+    /// Retry immediately: nothing is wrong with the listener.
+    Retry,
+    /// Retry after a backoff: the system is out of a resource we need.
+    Exhausted,
+    /// The listener itself is unusable; end the serve loop.
+    Fatal,
+}
+
+/// Classify an `accept(2)` error.
+///
+/// The distinction that matters is between "this *connection* failed" and
+/// "this *listener* is broken". Only the latter justifies leaving the loop,
+/// and leaving it is expensive: the process keeps serving traffic but no
+/// longer answers the control socket, so it can never be handed off again and
+/// the only way to deploy a new build is a hard restart — exactly the
+/// downtime this crate exists to avoid.
+///
+/// `ECONNABORTED` is the common benign case (peer went away between the
+/// handshake and our `accept`); `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` are
+/// transient exhaustion, with the pending connection still queued in the
+/// backlog once capacity returns. Everything else — `EBADF`, `EINVAL`,
+/// `ENOTSOCK` — means the listener is gone and retrying would spin forever.
+fn classify_accept_error(e: &std::io::Error) -> AcceptFailure {
+    if e.kind() == ErrorKind::Interrupted {
+        return AcceptFailure::Retry;
+    }
+    match e.raw_os_error() {
+        Some(libc::ECONNABORTED) | Some(libc::EPROTO) | Some(libc::EPERM) => AcceptFailure::Retry,
+        // `EAGAIN` should not occur on our blocking listener, but if the
+        // consumer handed us a non-blocking one it must not become a spin:
+        // backing off makes the loop poll instead.
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+        | Some(libc::EAGAIN) => AcceptFailure::Exhausted,
+        _ => AcceptFailure::Fatal,
     }
 }
 
@@ -215,7 +262,7 @@ impl Incumbent {
     /// [`Successor::announce_and_bind`], which orders `Ready` and bind in
     /// one call.
     pub fn bind_cold_start(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
-        bind_unlinking(socket_path, lock)
+        bind_replacing(socket_path, lock)
     }
 
     /// Successor-side bind, called by [`crate::BegunSuccessor::announce_and_bind`]
@@ -228,7 +275,7 @@ impl Incumbent {
     /// separate entry point exists so callers see a name that reflects the
     /// preconditions appropriate to their context.
     pub(crate) fn bind_after_ready(socket_path: &Path, lock: DataDirLock) -> Result<Self> {
-        bind_unlinking(socket_path, lock)
+        bind_replacing(socket_path, lock)
     }
 
     /// Set the implementation-defined build identifier announced in `Hello`.
@@ -239,12 +286,37 @@ impl Incumbent {
     }
 
     pub fn serve<D: Drainable + 'static>(mut self, drainable: D) -> Result<()> {
+        let mut backoff = ACCEPT_BACKOFF_MIN;
         loop {
             let (stream, _addr) = match self.listener.accept() {
-                Ok(x) => x,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Ok(x) => {
+                    backoff = ACCEPT_BACKOFF_MIN;
+                    x
+                }
+                Err(e) => match classify_accept_error(&e) {
+                    AcceptFailure::Retry => continue,
+                    AcceptFailure::Exhausted => {
+                        // Descriptor/memory exhaustion: the daemon is still
+                        // healthy and serving, and the condition is usually
+                        // transient. Returning here would end the serve loop
+                        // and leave a live process that can never be handed
+                        // off again — the failure mode this backoff exists to
+                        // avoid.
+                        tracing::warn!(
+                            error = %e, backoff_ms = backoff.as_millis() as u64,
+                            "accept failed due to resource exhaustion; backing off"
+                        );
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                        continue;
+                    }
+                    AcceptFailure::Fatal => return Err(e.into()),
+                },
             };
+            if let Err(e) = self.prepare_session_stream(&stream) {
+                tracing::warn!(error = %e, "rejecting control connection");
+                continue;
+            }
             match self.handle_session(stream, &drainable) {
                 Ok(SessionOutcome::Committed) => {
                     tracing::info!("handoff committed; incumbent exiting serve loop");
@@ -286,6 +358,23 @@ impl Incumbent {
         }
     }
 
+    /// Authenticate and configure a freshly accepted control connection.
+    ///
+    /// The socket's `0600` mode already keeps other users out on any sane
+    /// filesystem, but mode bits are advisory here in a way peer credentials
+    /// are not: an operator can loosen them, and some deployments put the
+    /// socket on a filesystem that ignores them. Since a control connection
+    /// can drain and seal the daemon, the uid the kernel latched at
+    /// `connect(2)` is checked directly.
+    fn prepare_session_stream(&self, stream: &UnixStream) -> Result<()> {
+        let uid = sock::peer_uid(stream)?;
+        if !sock::peer_uid_is_allowed(uid, &[]) {
+            return Err(Error::PeerNotPermitted { peer_uid: uid });
+        }
+        sock::configure_control_stream(stream, sock::CONTROL_WRITE_TIMEOUT)?;
+        Ok(())
+    }
+
     fn handle_session<D: Drainable>(
         &mut self,
         mut stream: UnixStream,
@@ -300,22 +389,24 @@ impl Incumbent {
             proto_max: PROTO_MAX,
             capabilities: Capabilities::default(),
         };
-        write_message(&mut stream, PROTO_MAX, &our_hello)?;
+        write_frame(&stream, PROTO_MAX, &our_hello)?;
 
         // Receive HelloAck. Bound the read so a peer that connected and then
         // stalled without responding can't pin the serve loop. `serve()`
         // accepts one session at a time, so a single stuck peer would
         // otherwise block every legitimate handoff.
+        //
+        // The accumulator carries any partial frame past the timeout: a peer
+        // that sent half a `HelloAck` before the deadline expired is answered
+        // by the deadline, not by a desynchronized reader that would misread
+        // the remaining bytes as the next frame's length.
+        let mut acc = FrameAccumulator::new();
         stream.set_read_timeout(Some(HELLO_READ_TIMEOUT))?;
-        let read_result = read_message(&mut stream);
+        let read_result = acc.poll_read(&mut stream);
         let _ = stream.set_read_timeout(None);
         let (_v, ack) = match read_result {
-            Ok(x) => x,
-            Err(Error::Io(e))
-                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
-                return Err(Error::Timeout("HelloAck"));
-            }
+            Ok(Some(x)) => x,
+            Ok(None) => return Err(Error::Timeout("HelloAck")),
             Err(e) => return Err(e),
         };
         let chosen = match ack {
@@ -332,7 +423,7 @@ impl Incumbent {
         };
 
         let mut state = SessionState::default();
-        let outcome = self.run_session_loop(&mut stream, chosen, drainable, &mut state);
+        let outcome = self.run_session_loop(&mut stream, &mut acc, chosen, drainable, &mut state);
 
         // Drain-without-commit cleanup. The consumer stopped accepting when we
         // called `drain`; we need to tell them to start again before we leave
@@ -354,13 +445,18 @@ impl Incumbent {
     fn run_session_loop<D: Drainable>(
         &mut self,
         stream: &mut UnixStream,
+        acc: &mut FrameAccumulator,
         chosen: u16,
         drainable: &D,
         state: &mut SessionState,
     ) -> Result<SessionOutcome> {
         loop {
-            let (_v, msg) = match read_message(stream) {
-                Ok(x) => x,
+            // No read timeout is armed here, so `poll_read` blocks until a
+            // whole frame arrives; `Ok(None)` is unreachable but is treated
+            // as "keep waiting" rather than asserted away.
+            let (_v, msg) = match acc.poll_read(stream) {
+                Ok(Some(x)) => x,
+                Ok(None) => continue,
                 Err(Error::Io(e))
                     if matches!(
                         e.kind(),
@@ -412,7 +508,7 @@ impl Incumbent {
                         %handoff_id, open_conns_remaining = report.open_conns_remaining,
                         "drain done"
                     );
-                    write_message(
+                    write_frame(
                         stream,
                         chosen,
                         &Message::Drained {
@@ -448,7 +544,7 @@ impl Incumbent {
                                 target: events::SEAL_COMPLETE,
                                 %handoff_id, "seal complete; flock released"
                             );
-                            write_message(
+                            write_frame(
                                 stream,
                                 chosen,
                                 &Message::SealComplete {
@@ -463,7 +559,7 @@ impl Incumbent {
                             tracing::error!(
                                 %handoff_id, error = %e, "seal failed; remaining as incumbent"
                             );
-                            write_message(
+                            write_frame(
                                 stream,
                                 chosen,
                                 &Message::SealFailed {
@@ -542,7 +638,7 @@ impl Incumbent {
                     state.active = None;
                 }
                 Message::Heartbeat { .. } => {
-                    write_message(
+                    write_frame(
                         stream,
                         chosen,
                         &Message::Heartbeat {
@@ -553,5 +649,73 @@ impl Incumbent {
                 other => return Err(Error::UnexpectedMessage(short_name(&other))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Error as IoError;
+
+    use super::*;
+
+    #[test]
+    fn transient_accept_errors_do_not_end_the_serve_loop() {
+        // The failure this guards against: a daemon that is alive and serving
+        // traffic but has left its accept loop, so no future handoff can ever
+        // reach it.
+        for errno in [libc::ECONNABORTED, libc::EPROTO, libc::EPERM, libc::EINTR] {
+            assert!(
+                matches!(
+                    classify_accept_error(&IoError::from_raw_os_error(errno)),
+                    AcceptFailure::Retry
+                ),
+                "errno {errno} should be retried immediately"
+            );
+        }
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EAGAIN,
+        ] {
+            assert!(
+                matches!(
+                    classify_accept_error(&IoError::from_raw_os_error(errno)),
+                    AcceptFailure::Exhausted
+                ),
+                "errno {errno} should back off, not exit and not spin"
+            );
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EFAULT] {
+            assert!(
+                matches!(
+                    classify_accept_error(&IoError::from_raw_os_error(errno)),
+                    AcceptFailure::Fatal
+                ),
+                "errno {errno} means the listener is unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_bind_is_private_and_replaces_a_stale_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("nested").join("ctl.sock");
+        std::fs::create_dir_all(sock_path.parent().unwrap()).unwrap();
+        // A stale socket file left by a crashed predecessor.
+        drop(UnixListener::bind(&sock_path).unwrap());
+
+        let lock = DataDirLock::acquire(dir.path()).unwrap();
+        let incumbent = Incumbent::bind_cold_start(&sock_path, lock).unwrap();
+        assert_eq!(
+            std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // The new binding is the one reachable at the path.
+        UnixStream::connect(&sock_path).expect("path serves the new listener");
+        drop(incumbent);
     }
 }
