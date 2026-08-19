@@ -267,8 +267,29 @@ pub fn socket_family(fd: RawFd) -> Option<libc::sa_family_t> {
     Some(storage.ss_family)
 }
 
-/// True if `fd` is a socket in the listening state (`SO_ACCEPTCONN`).
+/// True if `fd` is a socket in the listening state.
+///
+/// `SO_ACCEPTCONN` answers this directly on Linux. It is not dependable
+/// elsewhere — XNU's `sogetopt` does not report it for every socket kind —
+/// so on other Unices a negative answer falls back to the shape a listener
+/// has: a stream socket with no peer. `getpeername(2)` returns `ENOTCONN`
+/// for a listener and succeeds for a connected socket, which is the
+/// distinction the callers actually need (a bound-but-not-listening socket
+/// is indistinguishable this way, and merely surfaces later as an `accept`
+/// error rather than as a silently adopted wrong descriptor).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fd_is_listening(fd: RawFd) -> bool {
+    accept_conn_opt(fd).unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn fd_is_listening(fd: RawFd) -> bool {
+    accept_conn_opt(fd).unwrap_or(false)
+        || (socket_type(fd) == Some(libc::SOCK_STREAM) && !socket_is_connected(fd))
+}
+
+/// `SO_ACCEPTCONN`, or `None` where the platform does not implement it.
+fn accept_conn_opt(fd: RawFd) -> Option<bool> {
     let mut val: libc::c_int = 0;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: `val`/`len` are live locals of the sizes the option expects.
@@ -281,7 +302,47 @@ pub fn fd_is_listening(fd: RawFd) -> bool {
             &mut len,
         )
     };
-    rc == 0 && val != 0
+    if rc == 0 {
+        return Some(val != 0);
+    }
+    // EBADF/ENOTSOCK are real answers: not a listening socket.
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP) => None,
+        _ => Some(false),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn socket_type(fd: RawFd) -> Option<libc::c_int> {
+    let mut val: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `val`/`len` are live locals of the sizes the option expects.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut val as *mut libc::c_int as *mut c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(val)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn socket_is_connected(fd: RawFd) -> bool {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` is a live, correctly-sized `sockaddr_storage` and
+    // `len` describes it accurately.
+    let rc = unsafe {
+        libc::getpeername(
+            fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    rc == 0
 }
 
 /// Prepare a control-socket endpoint: close-on-exec, SIGPIPE suppression
