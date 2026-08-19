@@ -25,11 +25,12 @@ use crate::crash::points;
 use crate::crash_here;
 use crate::error::{Error, Result};
 use crate::fd::pass_listener_fds_on_spawn;
-use crate::frame::{read_message, write_message};
+use crate::frame::{FrameAccumulator, read_message, write_frame};
 use crate::metrics::events;
 use crate::protocol::{
     HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, negotiate_version, short_name,
 };
+use crate::sock;
 use crate::state::{Phase, StateJournal};
 use crate::util::now_unix_ms;
 
@@ -194,7 +195,11 @@ impl Drop for ChildGuard {
 }
 
 impl Supervisor {
+    /// Fails with [`Error::SocketPathTooLong`] if `socket_path` cannot fit in
+    /// `sockaddr_un` — better here, at construction, than as an opaque
+    /// `EINVAL` from `connect(2)` in the middle of a handoff.
     pub fn new(socket_path: &Path) -> Result<Self> {
+        sock::validate_socket_path(socket_path)?;
         Ok(Self {
             socket_path: socket_path.to_path_buf(),
             listener_fds: Vec::new(),
@@ -242,8 +247,20 @@ impl Supervisor {
 
         // 1. Connect to O.
         let mut o_stream = UnixStream::connect(&self.socket_path)?;
-        let chosen_o =
-            self.exchange_hello_as_supervisor(&mut o_stream, handoff_id, Side::Incumbent, None)?;
+        sock::configure_control_stream(&o_stream, sock::CONTROL_WRITE_TIMEOUT)?;
+        // One accumulator per stream, held for the whole handoff: it carries
+        // partial frames across the per-phase receive timeouts that are armed
+        // and disarmed below, so a reply split by a timeout boundary resumes
+        // instead of desynchronizing the stream.
+        let mut o_acc = FrameAccumulator::new();
+        let mut n_acc = FrameAccumulator::new();
+        let chosen_o = self.exchange_hello_as_supervisor(
+            &mut o_stream,
+            &mut o_acc,
+            handoff_id,
+            Side::Incumbent,
+            None,
+        )?;
         crash_here!(points::S_AFTER_O_HELLO);
 
         // 2. Create a socketpair for N's control channel.
@@ -260,10 +277,12 @@ impl Supervisor {
         crash_here!(points::S_AFTER_SPAWN_SUCCESSOR);
 
         let mut n_stream = s_end;
+        sock::configure_control_stream(&n_stream, sock::CONTROL_WRITE_TIMEOUT)?;
         // 4. Hello/HelloAck with N. Verify the child's announced PID matches
         // the one we spawned.
         let chosen_n = self.exchange_hello_as_supervisor(
             &mut n_stream,
+            &mut n_acc,
             handoff_id,
             Side::Successor,
             Some(successor_pid),
@@ -293,8 +312,8 @@ impl Supervisor {
             deadline_ms,
             "prepare handoff"
         );
-        write_message(
-            &mut o_stream,
+        write_frame(
+            &o_stream,
             chosen_o,
             &Message::PrepareHandoff {
                 handoff_id,
@@ -316,6 +335,7 @@ impl Supervisor {
         // reply that's already on the wire.
         let drained_msg = read_until(
             &mut o_stream,
+            &mut o_acc,
             spec.drain_grace + WIRE_SLACK,
             "Drained",
             |m| matches!(m, Message::Drained { .. }),
@@ -341,11 +361,7 @@ impl Supervisor {
         // 6. SealRequest → SealComplete (or SealFailed).
         let seal_at = Instant::now();
         tracing::info!(target: events::SEAL, %handoff_id, "seal request");
-        write_message(
-            &mut o_stream,
-            chosen_o,
-            &Message::SealRequest { handoff_id },
-        )?;
+        write_frame(&o_stream, chosen_o, &Message::SealRequest { handoff_id })?;
         crash_here!(points::S_AFTER_SEAL_REQUEST_SENT);
         // Seal-wait loop. Same two-tier timeout as `read_until`: per-recv
         // capped at LIVENESS_TIMEOUT (heartbeats reset it), wall-clock
@@ -372,28 +388,33 @@ impl Supervisor {
             let remaining = seal_read_deadline - now;
             let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
             arm_recv_timeout(&o_stream, recv_timeout)?;
-            match read_message(&mut o_stream) {
-                Ok((_, Message::SealProgress { .. })) => continue,
-                Ok((_, Message::Heartbeat { .. })) => continue,
-                Ok((_, Message::SealComplete { handoff_id: id, .. })) if id == handoff_id => {
+            match o_acc.poll_read(&mut o_stream) {
+                Ok(Some((_, Message::SealProgress { .. }))) => continue,
+                Ok(Some((_, Message::Heartbeat { .. }))) => continue,
+                Ok(Some((_, Message::SealComplete { handoff_id: id, .. }))) if id == handoff_id => {
                     break Ok(());
                 }
-                Ok((
+                Ok(Some((
                     _,
                     Message::SealFailed {
                         handoff_id: id,
                         error,
                         ..
                     },
-                )) if id == handoff_id => break Err(error),
-                Ok((_, other)) => {
+                ))) if id == handoff_id => break Err(error),
+                Ok(Some((_, other))) => {
                     let _ = o_stream.set_read_timeout(None);
                     return Err(Error::UnexpectedMessage(short_name(&other)));
                 }
-                Err(Error::Io(e)) if is_timeout(&e) => {
-                    // No frame for `recv_timeout` — peer has gone silent
-                    // for longer than LIVENESS_TIMEOUT (or we're at the
-                    // overall wall-clock cap; the next loop iteration
+                // Timed out mid-frame: O is demonstrably alive (it is
+                // writing), so this is not the peer-dead condition. Keep
+                // reading — the wall-clock check at the top of the loop still
+                // bounds the phase.
+                Ok(None) if o_acc.has_partial() => continue,
+                Ok(None) => {
+                    // No bytes at all for `recv_timeout` — peer has gone
+                    // silent for longer than LIVENESS_TIMEOUT (or we're at
+                    // the overall wall-clock cap; the next loop iteration
                     // detects that explicitly). Treat as peer-dead and
                     // abort.
                     let _ = o_stream.set_read_timeout(None);
@@ -453,28 +474,27 @@ impl Supervisor {
         // correct response in both cases (N is unreachable; O has sealed
         // and must be told to keep serving).
         let begin_at = Instant::now();
-        let ready_result =
-            match write_message(&mut n_stream, chosen_n, &Message::Begin { handoff_id }) {
-                Ok(()) => {
-                    crash_here!(points::S_AFTER_BEGIN_SENT);
-                    self.journal_set(
-                        handoff_id,
-                        Phase::AwaitingReady,
-                        successor_pid,
-                        started_unix_ms,
-                    )?;
-                    // N has no internal deadline for `announce_and_bind`,
-                    // so `Ready` can be in flight at the moment
-                    // `total_deadline_at` elapses — give the read
-                    // `WIRE_SLACK` past that cap for the same reason the
-                    // drain and seal reads do.
-                    let ready_timeout = remaining_until(total_deadline_at) + WIRE_SLACK;
-                    read_until(&mut n_stream, ready_timeout, "Ready", |m| {
-                        matches!(m, Message::Ready { .. })
-                    })
-                }
-                Err(e) => Err(e),
-            };
+        let ready_result = match write_frame(&n_stream, chosen_n, &Message::Begin { handoff_id }) {
+            Ok(()) => {
+                crash_here!(points::S_AFTER_BEGIN_SENT);
+                self.journal_set(
+                    handoff_id,
+                    Phase::AwaitingReady,
+                    successor_pid,
+                    started_unix_ms,
+                )?;
+                // N has no internal deadline for `announce_and_bind`,
+                // so `Ready` can be in flight at the moment
+                // `total_deadline_at` elapses — give the read
+                // `WIRE_SLACK` past that cap for the same reason the
+                // drain and seal reads do.
+                let ready_timeout = remaining_until(total_deadline_at) + WIRE_SLACK;
+                read_until(&mut n_stream, &mut n_acc, ready_timeout, "Ready", |m| {
+                    matches!(m, Message::Ready { .. })
+                })
+            }
+            Err(e) => Err(e),
+        };
 
         // The `Ready` match arm pulls the handoff_id apart so a mismatched id
         // produces a precise error rather than the misleading
@@ -523,9 +543,7 @@ impl Supervisor {
                     total_seconds = started_instant.elapsed().as_secs_f64(),
                     "commit"
                 );
-                if let Err(e) =
-                    write_message(&mut o_stream, chosen_o, &Message::Commit { handoff_id })
-                {
+                if let Err(e) = write_frame(&o_stream, chosen_o, &Message::Commit { handoff_id }) {
                     tracing::warn!(
                         %handoff_id, error = %e,
                         "failed to send Commit to incumbent; O may have crashed — \
@@ -564,8 +582,8 @@ impl Supervisor {
                 // Abort N, resume O.
                 send_best_effort_abort(&mut n_stream, chosen_n, handoff_id, reason.clone());
                 child_guard.kill_and_reap();
-                write_message(
-                    &mut o_stream,
+                write_frame(
+                    &o_stream,
                     chosen_o,
                     &Message::ResumeAfterAbort { handoff_id },
                 )?;
@@ -645,6 +663,7 @@ impl Supervisor {
     fn exchange_hello_as_supervisor(
         &self,
         stream: &mut UnixStream,
+        acc: &mut FrameAccumulator,
         handoff_id: HandoffId,
         expected_role: Side,
         expected_pid: Option<u32>,
@@ -653,11 +672,11 @@ impl Supervisor {
         // hangs before writing can't block `perform_handoff` indefinitely.
         // Cleared after the read regardless of outcome.
         arm_recv_timeout(stream, HELLO_READ_TIMEOUT)?;
-        let read_result = read_message(stream);
+        let read_result = acc.poll_read(stream);
         let _ = stream.set_read_timeout(None);
         let (_v, peer_hello) = match read_result {
-            Ok(x) => x,
-            Err(Error::Io(e)) if is_timeout(&e) => return Err(Error::Timeout("peer Hello")),
+            Ok(Some(x)) => x,
+            Ok(None) => return Err(Error::Timeout("peer Hello")),
             Err(e) => return Err(e),
         };
         let (their_role, their_pid, their_min, their_max) = match peer_hello {
@@ -685,7 +704,7 @@ impl Supervisor {
             });
         }
         let chosen = negotiate_version(PROTO_MIN, PROTO_MAX, their_min, their_max)?;
-        write_message(
+        write_frame(
             stream,
             chosen,
             &Message::HelloAck {
@@ -764,7 +783,7 @@ fn send_best_effort_abort(
     reason: String,
 ) {
     let reason_for_log = reason.clone();
-    if let Err(e) = write_message(stream, version, &Message::Abort { handoff_id, reason }) {
+    if let Err(e) = write_frame(stream, version, &Message::Abort { handoff_id, reason }) {
         tracing::warn!(
             %handoff_id,
             reason = %reason_for_log,
@@ -837,6 +856,7 @@ fn make_socketpair() -> Result<(UnixStream, UnixStream)> {
 /// step expired (e.g. `Timeout("Drained")` vs `Timeout("Ready")`).
 fn read_until<F>(
     stream: &mut UnixStream,
+    acc: &mut FrameAccumulator,
     timeout: Duration,
     awaiting: &'static str,
     pred: F,
@@ -858,18 +878,22 @@ where
         // the next iteration.
         let recv_timeout = LIVENESS_TIMEOUT.min(remaining).max(MIN_READ_TIMEOUT);
         arm_recv_timeout(stream, recv_timeout)?;
-        match read_message(stream) {
-            Ok((_, Message::Heartbeat { .. })) => continue,
-            Ok((_, Message::SealProgress { .. })) => continue,
-            Ok((_, msg)) if pred(&msg) => {
+        match acc.poll_read(stream) {
+            Ok(Some((_, Message::Heartbeat { .. }))) => continue,
+            Ok(Some((_, Message::SealProgress { .. }))) => continue,
+            Ok(Some((_, msg))) if pred(&msg) => {
                 let _ = stream.set_read_timeout(None);
                 return Ok(msg);
             }
-            Ok((_, other)) => {
+            Ok(Some((_, other))) => {
                 let _ = stream.set_read_timeout(None);
                 return Err(Error::UnexpectedMessage(short_name(&other)));
             }
-            Err(Error::Io(e)) if is_timeout(&e) => {
+            // Mid-frame at the timeout: the peer is writing, so the liveness
+            // clock has no business firing. The wall-clock deadline above
+            // still bounds the wait.
+            Ok(None) if acc.has_partial() => continue,
+            Ok(None) => {
                 let _ = stream.set_read_timeout(None);
                 return Err(Error::Timeout(awaiting));
             }
@@ -934,8 +958,4 @@ fn remaining_until(deadline: Instant) -> Duration {
         .checked_duration_since(Instant::now())
         .unwrap_or(MIN_READ_TIMEOUT)
         .max(MIN_READ_TIMEOUT)
-}
-
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }

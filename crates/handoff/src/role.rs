@@ -7,9 +7,41 @@
 //! - `HANDOFF_SOCK_FD=<n>` — open Unix socket to supervisor
 //! - `LISTEN_FDS=<n>` — count of inherited listener FDs (starting at FD 3)
 //! - `LISTEN_FDNAMES=resp:http:…` — colon-separated logical names in FD order
+//! - `LISTEN_PID=<pid>` — optional; when present it must equal our pid
 //!
 //! [`detect_role`] reads these and consumes them so an accidental double-detect
 //! gives [`Role::ColdStart`] (which is what fresh re-execs should do).
+//!
+//! # Why the descriptors are validated before adoption
+//!
+//! `LISTEN_FDS`/`LISTEN_FDNAMES`/`LISTEN_PID` are systemd's variables, not
+//! ours — we speak that convention so a socket-activated unit can cold-start a
+//! handoff-aware daemon unchanged. The cost is that these names can arrive
+//! from somewhere other than a handoff supervisor, and `FromRawFd` validates
+//! nothing: a stale `LISTEN_FDS=3` inherited through an unrelated `execve`
+//! would have us wrap FDs 3–5 — possibly a log file, a database connection, or
+//! nothing at all — in `TcpListener`s and close them when they drop.
+//!
+//! Two defenses, in the order the kernel lets us apply them:
+//!
+//! 1. **`LISTEN_PID`.** systemd always sets it to the pid it is activating.
+//!    If it is present and names a different process, the whole block belongs
+//!    to an ancestor and is ignored. (The supervisor in this crate cannot set
+//!    it — the value is only knowable after `fork`, and `Command`'s
+//!    environment is materialized before `pre_exec` runs — so its absence is
+//!    not by itself suspicious. Successor identity is instead verified on the
+//!    wire by the `Hello` pid check.)
+//! 2. **Per-descriptor validation.** Every slot must be an open socket
+//!    (`fstat` reports `S_IFSOCK`), and [`InheritedListeners::take`] /
+//!    [`InheritedListeners::take_unix`] additionally require the listening
+//!    state and the right address family before handing back a typed listener.
+//!
+//! Adopted descriptors are also normalized: `FD_CLOEXEC` is re-armed (the
+//! parent's `dup2` cleared it so the FD could survive `execve`, but leaving it
+//! clear leaks listeners and the control socket into every subprocess the
+//! daemon later spawns) and `O_NONBLOCK` is cleared (it lives on the open file
+//! description, so a parent that gave its listener to an async runtime would
+//! otherwise hand us a listener whose first `accept()` returns `EAGAIN`).
 
 // Env mutation (`env::remove_var`, `env::set_var`) is `unsafe` in Rust 2024
 // because it races with concurrent env reads in other threads; this module
@@ -23,17 +55,18 @@ use std::env;
 use std::marker::PhantomData;
 use std::net::TcpListener;
 use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use crate::drainable::ReadinessSnapshot;
 use crate::error::{Error, Result};
-use crate::frame::{read_message, write_message};
+use crate::frame::{read_message, write_frame};
 use crate::protocol::{
     Capabilities, HandoffId, Message, PROTO_MAX, PROTO_MIN, ProtoVersion, Side, short_name,
 };
+use crate::sock;
 use crate::util::now_unix_ms;
 
 /// Cadence matched to the incumbent's heartbeat thread; with the
@@ -45,6 +78,9 @@ pub const ENV_HANDOFF_ROLE: &str = "HANDOFF_ROLE";
 pub const ENV_HANDOFF_SOCK_FD: &str = "HANDOFF_SOCK_FD";
 pub const ENV_LISTEN_FDS: &str = "LISTEN_FDS";
 pub const ENV_LISTEN_FDNAMES: &str = "LISTEN_FDNAMES";
+/// systemd sets this to the pid of the process it is activating. Honored when
+/// present; see the module docs for why we never set it ourselves.
+pub const ENV_LISTEN_PID: &str = "LISTEN_PID";
 
 /// Inherited listener FDs start here, matching the systemd convention.
 pub const SD_LISTEN_FDS_START: RawFd = 3;
@@ -68,12 +104,71 @@ pub struct InheritedListeners {
 }
 
 impl InheritedListeners {
-    /// Consume the inherited listener for `name`. Returns `None` if no such
-    /// listener was passed (or it was already taken).
+    /// Consume the inherited TCP listener for `name`.
+    ///
+    /// Returns `None` if no such listener was passed, if it was already taken,
+    /// or if the descriptor is not a listening `AF_INET`/`AF_INET6` socket —
+    /// the last case is logged at WARN and leaves the descriptor untouched
+    /// rather than wrapping (and eventually closing) a descriptor that belongs
+    /// to something else. Use [`Self::take_unix`] for `AF_UNIX` listeners.
     pub fn take(&mut self, name: &str) -> Option<TcpListener> {
-        let fd = self.listeners.remove(name)?;
-        // SAFETY: kernel inherited the FD to us via fork+exec; we own it.
+        let fd = self.take_validated(
+            name,
+            &[
+                libc::AF_INET as libc::sa_family_t,
+                libc::AF_INET6 as libc::sa_family_t,
+            ],
+            "TCP",
+        )?;
+        // SAFETY: validated just above as a live, listening AF_INET/AF_INET6
+        // socket that the kernel handed us via fork+exec; nothing else in this
+        // process owns it, and the map entry is now gone.
         Some(unsafe { TcpListener::from_raw_fd(fd) })
+    }
+
+    /// Consume the inherited Unix-domain listener for `name`.
+    ///
+    /// The same inheritance convention covers `AF_UNIX` listeners — a daemon
+    /// serving on a Unix socket has exactly the same reason to keep its
+    /// binding across a handoff as one serving TCP, and rebinding the path
+    /// would drop connections queued in the backlog.
+    pub fn take_unix(&mut self, name: &str) -> Option<UnixListener> {
+        let fd = self.take_validated(name, &[libc::AF_UNIX as libc::sa_family_t], "Unix")?;
+        // SAFETY: validated as a live, listening AF_UNIX socket owned by us.
+        Some(unsafe { UnixListener::from_raw_fd(fd) })
+    }
+
+    /// Shared validation for the typed `take*` accessors. Only removes the
+    /// entry when the descriptor really is a listening socket of one of
+    /// `families`, so a mismatched call can't silently discard a listener the
+    /// consumer will ask for again under the right accessor.
+    fn take_validated(
+        &mut self,
+        name: &str,
+        families: &[libc::sa_family_t],
+        kind: &str,
+    ) -> Option<RawFd> {
+        let fd = *self.listeners.get(name)?;
+        if !sock::fd_is_listening(fd) {
+            tracing::warn!(
+                name,
+                fd,
+                "inherited descriptor is not a listening socket; refusing to adopt it"
+            );
+            return None;
+        }
+        match sock::socket_family(fd) {
+            Some(f) if families.contains(&f) => {}
+            other => {
+                tracing::warn!(
+                    name, fd, family = ?other,
+                    "inherited listener is not a {kind} socket; refusing to adopt it"
+                );
+                return None;
+            }
+        }
+        self.listeners.remove(name);
+        Some(fd)
     }
 
     /// Names of all listeners that haven't yet been taken.
@@ -134,6 +229,11 @@ pub struct BegunSuccessor {
 /// listeners. Env vars are removed so re-entry yields a clean state.
 pub fn detect_role() -> Result<Role> {
     let inherited = read_inherited_listeners();
+    // SAFETY: same single-threaded-startup invariant as the other env
+    // mutations in this function.
+    unsafe {
+        env::remove_var(ENV_LISTEN_PID);
+    }
     // SAFETY: `env::remove_var` races with concurrent env reads on other
     // threads (`std::env::set_var` / `getenv` from libc). `detect_role` is
     // contracted to run during single-threaded startup before the primitive
@@ -164,10 +264,37 @@ pub fn detect_role() -> Result<Role> {
         env::remove_var(ENV_HANDOFF_SOCK_FD);
     }
 
-    // SAFETY: the supervisor handed us this FD via `fork+exec`. It's open and
-    // owned by us from here on.
+    if !sock::fd_is_socket(sock_fd) {
+        return Err(Error::BadEnv {
+            var: ENV_HANDOFF_SOCK_FD,
+            value: format!("fd {sock_fd} is not an open socket"),
+        });
+    }
+    // The control socket needs the same normalization as the listeners: it
+    // must not leak into subprocesses (a leaked copy holds the supervisor's
+    // EOF open, hiding our death from it) and the protocol code assumes
+    // blocking reads.
+    normalize_inherited_fd(sock_fd, "control socket");
+
+    // SAFETY: the supervisor handed us this FD via `fork+exec` and we have
+    // just confirmed it is an open socket. It's owned by us from here on.
     let control = unsafe { UnixStream::from_raw_fd(sock_fd) };
+    if let Err(e) = sock::configure_control_stream(&control, sock::CONTROL_WRITE_TIMEOUT) {
+        tracing::warn!(error = %e, "could not configure successor control socket");
+    }
     Ok(Role::Successor(Successor { control, inherited }))
+}
+
+/// Re-arm `FD_CLOEXEC` and clear `O_NONBLOCK` on an adopted descriptor.
+/// Best-effort: a failure is logged and the descriptor is still usable, just
+/// with the inherited flag state.
+fn normalize_inherited_fd(fd: RawFd, what: &str) {
+    if let Err(e) = sock::set_cloexec(fd) {
+        tracing::warn!(fd, error = %e, "could not re-arm FD_CLOEXEC on inherited {what}");
+    }
+    if let Err(e) = sock::clear_nonblocking(fd) {
+        tracing::warn!(fd, error = %e, "could not clear O_NONBLOCK on inherited {what}");
+    }
 }
 
 fn read_inherited_listeners() -> InheritedListeners {
@@ -178,6 +305,22 @@ fn read_inherited_listeners() -> InheritedListeners {
     if count == 0 {
         return InheritedListeners::default();
     }
+    // systemd's activation contract: the FD block belongs to the pid named in
+    // LISTEN_PID. If it names someone else, we inherited the variables through
+    // an intervening exec and the descriptors are not ours to touch.
+    if let Ok(raw) = env::var(ENV_LISTEN_PID) {
+        let ours = std::process::id();
+        match raw.trim().parse::<u32>() {
+            Ok(pid) if pid == ours => {}
+            other => {
+                tracing::warn!(
+                    listen_pid = %raw, our_pid = ours, parsed = ?other.ok(),
+                    "LISTEN_PID does not name this process; ignoring inherited listeners"
+                );
+                return InheritedListeners::default();
+            }
+        }
+    }
     let names: Vec<String> = env::var(ENV_LISTEN_FDNAMES)
         .ok()
         .map(|s| s.split(':').map(|s| s.to_string()).collect())
@@ -186,6 +329,19 @@ fn read_inherited_listeners() -> InheritedListeners {
     for i in 0..count {
         let fd = SD_LISTEN_FDS_START + i as RawFd;
         let name = names.get(i).cloned().unwrap_or_else(|| i.to_string());
+        if !sock::fd_is_socket(fd) {
+            // Either the count over-reports what was passed, or the variables
+            // reached us from an unrelated ancestor. Skipping is the only safe
+            // response: adopting the slot would hand a `TcpListener` a
+            // descriptor it does not own and close it on drop.
+            tracing::warn!(
+                name,
+                fd,
+                "LISTEN_FDS names a descriptor that is not an open socket; skipping"
+            );
+            continue;
+        }
+        normalize_inherited_fd(fd, "listener");
         map.insert(name, fd);
     }
     InheritedListeners { listeners: map }
@@ -205,7 +361,7 @@ impl Successor {
             proto_max: PROTO_MAX,
             capabilities: Capabilities::default(),
         };
-        write_message(&mut self.control, PROTO_MAX, &hello)?;
+        write_frame(&self.control, PROTO_MAX, &hello)?;
         let (_ver, ack) = read_message(&mut self.control)?;
         match ack {
             Message::HelloAck {
@@ -281,6 +437,12 @@ impl BegunSuccessor {
         self.inherited.take(name)
     }
 
+    /// Consume the inherited Unix-domain listener for `name`. See
+    /// [`InheritedListeners::take_unix`].
+    pub fn take_unix_listener(&mut self, name: &str) -> Option<UnixListener> {
+        self.inherited.take_unix(name)
+    }
+
     /// Names of inherited listeners that haven't yet been taken.
     pub fn listener_names(&self) -> Vec<String> {
         self.inherited.names()
@@ -308,14 +470,14 @@ impl BegunSuccessor {
     /// correctly by construction. Use this lower-level entry point only
     /// when you genuinely need to delay binding (e.g. for additional
     /// post-`Ready` setup that does not require the control socket).
-    pub fn announce_ready(mut self, snapshot: ReadinessSnapshot) -> Result<()> {
+    pub fn announce_ready(self, snapshot: ReadinessSnapshot) -> Result<()> {
         let ready = Message::Ready {
             handoff_id: self.handoff_id,
             listening_on: snapshot.listening_on,
             healthz_ok: snapshot.healthz_ok,
             advertised_revision_per_shard: snapshot.advertised_revision_per_shard,
         };
-        write_message(&mut self.control, self.proto_version, &ready)?;
+        write_frame(&self.control, self.proto_version, &ready)?;
         Ok(())
     }
 
@@ -393,7 +555,6 @@ impl<'a> HeartbeatGuard<'a> {
         };
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
-            let mut writer = writer;
             // `recv_timeout` returns Err on timeout — "no stop yet, send
             // another heartbeat". `Ok(())` or any other Err (sender
             // dropped) is the stop signal.
@@ -401,7 +562,7 @@ impl<'a> HeartbeatGuard<'a> {
                 let msg = Message::Heartbeat {
                     ts_ms: now_unix_ms(),
                 };
-                if write_message(&mut writer, chosen, &msg).is_err() {
+                if write_frame(&writer, chosen, &msg).is_err() {
                     // Supervisor gone or socket broken — no point continuing.
                     return;
                 }
@@ -428,6 +589,8 @@ impl Drop for HeartbeatGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
 
     // Env mutation is process-global; run env-touching tests sequentially in
@@ -455,5 +618,92 @@ mod tests {
         unsafe {
             env::remove_var(ENV_HANDOFF_ROLE);
         }
+
+        // LISTEN_PID naming another process: the whole block belongs to an
+        // ancestor and must be ignored, however plausible LISTEN_FDS looks.
+        // SAFETY: same single-threaded-test invariant as above.
+        unsafe {
+            env::set_var(ENV_LISTEN_FDS, "3");
+            env::set_var(ENV_LISTEN_FDNAMES, "http:grpc:admin");
+            env::set_var(ENV_LISTEN_PID, (std::process::id() + 1).to_string());
+        }
+        match detect_role().unwrap() {
+            Role::ColdStart { inherited } => assert!(
+                inherited.is_empty(),
+                "listeners adopted despite a foreign LISTEN_PID: {:?}",
+                inherited.names()
+            ),
+            _ => panic!("expected ColdStart"),
+        }
+
+        // Matching LISTEN_PID: the block is ours, but every slot still has to
+        // prove it is an open socket before it lands in the map. Under a test
+        // harness those low FDs are the harness's own files and pipes, so a
+        // count that over-reports must never produce an adoptable entry.
+        // SAFETY: same single-threaded-test invariant as above.
+        unsafe {
+            env::set_var(ENV_LISTEN_FDS, "3");
+            env::remove_var(ENV_LISTEN_FDNAMES);
+            env::set_var(ENV_LISTEN_PID, std::process::id().to_string());
+        }
+        match detect_role().unwrap() {
+            Role::ColdStart { inherited } => {
+                for (name, fd) in &inherited.listeners {
+                    assert!(
+                        crate::sock::fd_is_socket(*fd),
+                        "adopted non-socket fd {fd} as listener {name}"
+                    );
+                }
+            }
+            _ => panic!("expected ColdStart"),
+        }
+
+        // SAFETY: same single-threaded-test invariant as above.
+        unsafe {
+            env::remove_var(ENV_LISTEN_FDS);
+            env::remove_var(ENV_LISTEN_PID);
+        }
+    }
+
+    #[test]
+    fn take_and_take_unix_are_family_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let unix = crate::sock::bind_socket(&dir.path().join("s.sock")).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut inherited = InheritedListeners {
+            listeners: HashMap::from([
+                ("unix".to_string(), unix.as_raw_fd()),
+                ("tcp".to_string(), tcp.as_raw_fd()),
+            ]),
+        };
+
+        // Wrong accessor for the family: refuse, and keep the entry so the
+        // right accessor still works.
+        assert!(inherited.take("unix").is_none());
+        assert!(inherited.take_unix("tcp").is_none());
+
+        let adopted_tcp = inherited.take("tcp").expect("tcp listener adoptable");
+        let adopted_unix = inherited
+            .take_unix("unix")
+            .expect("unix listener adoptable");
+        assert!(inherited.is_empty());
+        // The adopted wrappers own the FDs now; forget the originals so the
+        // test doesn't double-close them on drop.
+        std::mem::forget(unix);
+        std::mem::forget(tcp);
+        drop((adopted_tcp, adopted_unix));
+    }
+
+    #[test]
+    fn take_refuses_a_connected_socket() {
+        // A connected (non-listening) socket in a listener slot means the
+        // count or the FD order is wrong; adopting it would produce a
+        // `TcpListener` whose `accept()` fails forever.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut inherited = InheritedListeners {
+            listeners: HashMap::from([("http".to_string(), client.as_raw_fd())]),
+        };
+        assert!(inherited.take("http").is_none());
     }
 }

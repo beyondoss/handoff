@@ -3,6 +3,7 @@
 //! All fallible operations in the library return [`Result<T>`]. The error enum
 //! is `Send` so it can flow across the consumer's runtime-bridging channels.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{RecvError, RecvTimeoutError, SendError};
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +51,20 @@ pub enum Error {
 
     #[error("refused to break lock held by live process {holder_pid}")]
     StaleLockBreakRefused { holder_pid: i32 },
+
+    #[error(
+        "unix socket path {} is {len} bytes, which exceeds the {max}-byte \
+         sun_path limit on this platform",
+        .path.display()
+    )]
+    SocketPathTooLong {
+        path: PathBuf,
+        len: usize,
+        max: usize,
+    },
+
+    #[error("control socket peer uid {peer_uid} is not permitted")]
+    PeerNotPermitted { peer_uid: u32 },
 
     #[error("handoff already in progress")]
     HandoffInProgress,

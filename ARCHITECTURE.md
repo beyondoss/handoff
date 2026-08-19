@@ -133,6 +133,31 @@ The supervisor binds sockets once at cold start and passes them to every child v
 
 The kernel-level socket (and its accept queue) is never closed. Connections arriving during the O→N transition queue in the kernel and N's first `accept()` picks them up. The listen socket never goes "down" from a client's perspective.
 
+**Adoption is validated, not assumed.** `LISTEN_FDS`/`LISTEN_FDNAMES`/`LISTEN_PID` are systemd's variables, so they can reach a process from something other than a handoff supervisor, and `FromRawFd` checks nothing. `role.rs` therefore:
+
+1. Ignores the whole block when `LISTEN_PID` is present and names another process (systemd's activation contract). This supervisor cannot set `LISTEN_PID` — the child's pid is only knowable after `fork`, and `Command`'s environment is materialized before `pre_exec` — so its *absence* is not suspicious; successor identity is verified on the wire by the `Hello` pid check instead.
+2. Skips any advertised slot that `fstat` does not report as a socket, and requires the listening state plus the right address family (`InheritedListeners::take` for TCP, `take_unix` for `AF_UNIX`) before handing back a typed listener. A refused slot is left untouched rather than wrapped — a wrapper would close a descriptor belonging to something else when it drops.
+
+**Adopted descriptors are normalized.** `FD_CLOEXEC` is re-armed (the parent's `dup2` cleared it so the FD would survive `execve`; leaving it clear leaks listeners and the control socket into every subprocess the daemon later spawns — and a leaked control-socket copy holds the supervisor's EOF open, hiding the primitive's death) and `O_NONBLOCK` is cleared (it lives on the open file description, so a parent that gave its listener to an async runtime would otherwise hand the child a listener whose first `accept()` returns `EAGAIN`).
+
+### Control socket ownership and access control
+
+A control connection can drain and seal the daemon, so the socket is a privileged surface, not just an IPC detail:
+
+- **Bound `0600`, atomically.** `sock::bind_socket` binds a short staging name in the target directory, chmods it, then `rename(2)`s it over the published path. The socket is never reachable while its mode is still `0777 & ~umask`, and a rebind never leaves a window where the path is missing (which the previous unlink-then-bind sequence did — a client connecting inside it gets `ENOENT`, and a second binder racing in it silently steals the name).
+- **Peer-uid checked.** Every accepted connection's uid is read from the kernel (`SO_PEERCRED` on Linux, `getpeereid(3)` elsewhere) — latched at `connect(2)`, so it cannot be forged or raced. The daemon's own euid and root are accepted; everything else is refused. Mode bits alone are not sufficient: they can be loosened by an operator, and some filesystems ignore them.
+- **Path length validated up front.** `Supervisor::new` and every bind reject a path that does not fit in `sockaddr_un.sun_path` (108 bytes on Linux, 104 elsewhere) with `Error::SocketPathTooLong`, instead of surfacing an opaque `EINVAL` mid-handoff or, on some BSDs, binding a silently truncated path.
+
+### Accept-loop resilience
+
+`Incumbent::serve` distinguishes "this *connection* failed" from "this *listener* is broken", because leaving the loop is far more expensive than it looks: the process keeps serving traffic but stops answering the control socket, so it can never be handed off again and the only way to deploy a new build is a hard restart — the downtime this crate exists to avoid.
+
+| `accept(2)` error | Response |
+|---|---|
+| `EINTR`, `ECONNABORTED`, `EPROTO`, `EPERM` | Retry immediately (the peer went away, or a firewall hook rejected it) |
+| `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `EAGAIN` | Sleep and retry, exponential 5 ms → 1 s, reset on the next success; the connection stays queued in the backlog |
+| anything else (`EBADF`, `EINVAL`, `ENOTSOCK`, …) | Fatal — the listener is unusable and retrying would spin |
+
 ### Flock ordering (the load-bearing piece)
 
 O releases the flock in `SealRequest` handling (`incumbent.rs:run_session_loop`), immediately after `drainable.seal()` succeeds — before sending `SealComplete`, before receiving `Commit`, before exiting. This is the critical ordering:
@@ -157,6 +182,10 @@ Every message is a length-prefixed frame over a `UnixStream`:
 
 Frame size is capped at 1 MiB (`MAX_FRAME_BYTES`) to bound allocation on the reader side. The `Message` enum's variant discriminant is encoded by postcard as part of the payload — no separate type byte. See `frame.rs`.
 
+**Reads are resumable.** Every protocol read is armed with `SO_RCVTIMEO`, and `read_exact` discards what it already consumed when a read fails — so a frame straddling a timeout boundary leaves the stream mid-frame and the next read interprets payload bytes as a length prefix, corrupting every frame after it. `FrameAccumulator` owns the partial bytes instead: a timeout is a *suspension* (`Ok(None)`), and the caller decides whether to keep waiting or give up. Callers use `has_partial()` to tell "peer has gone silent" (nothing buffered — treat as peer-dead) from "peer is mid-frame" (buffered bytes prove liveness; only the wall-clock budget applies).
+
+**Writes are bounded and signal-safe.** Control-socket frames go out through `write_frame` → `sock::send_all`, which uses `MSG_NOSIGNAL` (Linux) or `SO_NOSIGPIPE` (macOS/BSD): a peer that died mid-handoff yields `EPIPE`, never a process-killing `SIGPIPE`. Rust's runtime ignores `SIGPIPE` by default, but that is a property of the embedding *binary*, not of this library. Endpoints also carry `SO_SNDTIMEO` (`CONTROL_WRITE_TIMEOUT`, 10 s), since a peer that stops reading would otherwise park the writer in an unbounded `write(2)` — the one place in the handoff where neither the liveness clock nor the deadline is running, both being enforced on the read side.
+
 ### Protocol negotiation
 
 Both sides announce `proto_min`/`proto_max` in `Hello`. `negotiate_version()` picks the highest version in the intersection. If ranges are disjoint, returns `Error::VersionMismatch` and the connection is closed before any handoff begins. Currently only version 1 exists (`PROTO_MIN == PROTO_MAX == 1`).
@@ -172,13 +201,15 @@ Journal writes use `postcard` serialization; the rename makes each write crash-s
 `DataDirLock::acquire_or_break_stale()` handles the case where the lockfile holds a PID that is no longer alive:
 
 1. Try `acquire()`. If it succeeds, done.
-2. If `LockHeld`, read the pidfile and call `kill(pid, 0)`.
+2. If `LockHeld`, read the pidfile and call `kill(pid, 0)`. Only `ESRCH` counts as dead: `EPERM` means the process exists but runs as another user (a daemon restarted under a different service account, or an operator recovering as non-root), and reading that as "dead" would send the stale-break path after a live holder.
 3. If the PID is alive: return `StaleLockBreakRefused`. Never break a live holder.
 4. If the PID is dead: retry `acquire()` on the same lockfile inode. The kernel released the flock when the holder process died, so the second attempt succeeds. If something is still genuinely holding the flock (an inherited FD outliving the named holder, or a brief PID-reuse race), the retry returns `LockHeld` again and we surface `StaleLockBreakRefused`.
 
 We deliberately do **not** unlink the lockfile and acquire on a fresh inode: that path can split-brain invariant #1 by leaving two processes each holding "the lock" on separate inodes if the original inode's flock is still held. The pidfile is advisory; the kernel-level flock on the existing inode is the source of truth.
 
 See `lock.rs:acquire_or_break_stale()`.
+
+**Filesystem requirement.** `flock(2)` excludes only the contenders a single kernel sees. Local filesystems (ext4, xfs, btrfs, zfs, apfs, ufs) are the supported configuration; NFS, CIFS/SMB, 9p, and FUSE without lock forwarding either emulate `flock` with different (per-process) semantics or degrade to a purely local lock that two hosts will both "acquire". Two containers bind-mounting one host directory are fine (same kernel); two hosts sharing network storage are not. A lock that does not exclude produces exactly the two-writer failure this crate exists to prevent, and the holder cannot detect it — put the data directory on a local filesystem.
 
 ## State Machine
 
@@ -294,6 +325,9 @@ When O's `serve()` loop catches a session error and the data-dir flock is not he
 - `handoff_id` in every message matches the active handoff — rejects replayed or cross-session messages.
 - Frame length is ≤ 1 MiB — prevents unbounded allocation from a malformed peer.
 - `Commit` is not accepted before `SealComplete` — protocol ordering is enforced.
+- The connecting peer's uid (from `SO_PEERCRED`/`getpeereid`) is the daemon's own or root — on both the control socket and the reference supervisor's trigger socket.
+- Inherited listener descriptors are open sockets of the expected family and listening state, and `LISTEN_PID`, when present, names this process.
+- A binary named by a trigger client is on the configured allowlist.
 
 **What passes through unchecked:**
 
@@ -304,7 +338,9 @@ When O's `serve()` loop catches a session error and the data-dir flock is not he
 
 **Why these boundaries are where they are:**
 
-The library is embedded in a trusted, same-host supervisor process. All three roles (S, O, N) are spawned by the same operator; no external network is involved. Authentication between them is not needed — the Unix socket path is the security boundary. If an untrusted process can connect to the control socket, the host is already compromised.
+The library is embedded in a trusted, same-host supervisor process. All three roles (S, O, N) are spawned by the same operator and no external network is involved, so the checks stop at *which local user* is talking — there is no cryptographic authentication of message contents.
+
+The socket path alone is not treated as the boundary, though. Filesystem permissions on a Unix socket depend on the process umask and are ignored by some filesystems, and a multi-tenant host routinely has unprivileged local users who should not be able to drain a database. So the sockets are bound `0600` *and* every peer's uid is checked; the reference supervisor additionally refuses to exec a binary a client names unless it is on an allowlist. These are cheap, and they change "any local uid can force a drain+seal" into "a local uid that is already the service account or root can".
 
 ## Package Structure
 
@@ -312,7 +348,8 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 |------|-------------|
 | `crates/handoff/src/lib.rs` | Re-exports public surface; no logic |
 | `crates/handoff/src/protocol.rs` | Wire message enum + framing constants; `negotiate_version()` |
-| `crates/handoff/src/frame.rs` | `read_message` / `write_message`; 1 MiB frame cap |
+| `crates/handoff/src/frame.rs` | `read_message` / `write_message` / `write_frame`; `FrameAccumulator` (resumable reads); 1 MiB frame cap |
+| `crates/handoff/src/sock.rs` | Unix-socket mechanics: `sun_path` validation, atomic `0600` bind, peer-uid lookup, FD flag normalization, SIGPIPE-safe writes |
 | `crates/handoff/src/supervisor.rs` | `Supervisor::perform_handoff()`; `ChildGuard`; journal writes; `spawn_successor()` pre_exec dance |
 | `crates/handoff/src/incumbent.rs` | `Incumbent::serve()`; per-session state machine; flock release on seal |
 | `crates/handoff/src/drainable.rs` | `Drainable` trait + report types (`DrainReport`, `SealReport`, `StateSnapshot`) |
@@ -334,7 +371,9 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 | `args` | `[]` | Argv passed to every primitive spawn |
 | `env` | `[]` | Extra env vars merged into every spawn's environment |
 | `listeners` | `[]` | Sockets S binds at startup; inherited by every primitive via LISTEN_FDS |
-| `trigger_socket` | (required) | Unix socket S listens on for `handoff [binary]` trigger commands |
+| `trigger_socket` | (required) | Unix socket S listens on for `handoff [binary]` trigger commands; bound `0600`, peer-uid checked, 10 s I/O timeout and 4 KiB command cap per client |
+| `allowed_uids` | `[]` | Extra uids permitted to issue trigger commands (S's own uid and root always are) |
+| `allowed_binaries` | `[]` | Paths a trigger client may name in `handoff <binary>`, in addition to `binary`. Compared after canonicalization; anything else is refused — an unrestricted override is a "run this file as the supervisor's user" primitive |
 | `journal` | `None` | If set, S writes phase journal here for crash recovery |
 | `drain_grace_secs` | `25` | Budget S gives O for the drain phase before sending `Drained`; S's read for the reply extends `WIRE_SLACK` (1 s) past this cap |
 | `deadline_secs` | `60` | Overall handoff deadline (post-drain through Ready); S's reads for `SealComplete` and `Ready` extend `WIRE_SLACK` (1 s) past this cap |
@@ -359,7 +398,10 @@ The library is embedded in a trusted, same-host supervisor process. All three ro
 | Second `PrepareHandoff` with different `handoff_id` | O returns `Error::HandoffInProgress`; session closes | S observes disconnect; must start fresh session |
 | Frame > 1 MiB received | `Error::FrameTooLarge`; connection closed | Peer has a bug; reconnect |
 | Protocol version mismatch | `Error::VersionMismatch`; connection closed before any handoff begins | Upgrade either S or the primitive |
-| Stale pidfile, holder dead | `acquire_or_break_stale()` detects dead PID via `kill(pid, 0)`; unlinks files; acquires on fresh inode | Automatic; no manual intervention |
+| Stale pidfile, holder dead | `acquire_or_break_stale()` detects `ESRCH` from `kill(pid, 0)`; retries `acquire()` on the same lockfile inode | Automatic; no manual intervention |
+| `accept()` fails transiently (`ECONNABORTED`, `EMFILE`, …) | O retries, backing off 5 ms → 1 s on resource exhaustion; the serve loop survives | Automatic; the queued connection is picked up when capacity returns |
+| Control frame straddles a receive timeout | `FrameAccumulator` retains the partial frame; the read resumes where it stopped | Automatic; no stream desynchronization |
+| Control peer is an unauthorized local uid | Connection refused before any protocol frame is read; logged at WARN | Add the uid to `allowed_uids` if it is legitimate |
 | Stale pidfile, holder alive | `Error::StaleLockBreakRefused` — refuses to evict a live process | Manual investigation required; indicates two supervisors for one data dir |
 
 ## Observability
@@ -421,7 +463,10 @@ impl HandshookSuccessor {
 
 pub struct BegunSuccessor;
 impl BegunSuccessor {
+    /// `None` if the name was not passed, was already taken, or the
+    /// descriptor is not a listening socket of the expected family.
     pub fn take_listener(&mut self, name: &str) -> Option<TcpListener>;
+    pub fn take_unix_listener(&mut self, name: &str) -> Option<UnixListener>;
     pub fn handoff_id(&self) -> HandoffId;
     pub fn listener_names(&self) -> Vec<String>;
     /// Send `Ready`. Caller must NOT bind the control socket until the
@@ -440,9 +485,10 @@ impl BegunSuccessor {
 
 pub struct Incumbent;
 impl Incumbent {
-    /// Cold-start bind. Unlinks any stale socket file before binding;
-    /// safe only when no prior incumbent is alive on this path. From a
-    /// successor, use `Successor::announce_and_bind` instead.
+    /// Cold-start bind. Takes over the path from any stale binding via
+    /// bind-then-rename (mode `0600`, no missing-path window); safe only
+    /// when no prior incumbent is alive on this path. From a successor,
+    /// use `Successor::announce_and_bind` instead.
     pub fn bind_cold_start(socket_path: &Path, lock: DataDirLock) -> Result<Self>;
     pub fn with_build_id(self, build_id: Vec<u8>) -> Self;
     pub fn serve<D: Drainable + 'static>(self, drainable: D) -> Result<()>;

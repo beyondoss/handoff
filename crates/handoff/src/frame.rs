@@ -11,10 +11,12 @@
 //! Frames are bounded by [`MAX_FRAME_BYTES`] to keep a malicious or buggy peer
 //! from triggering an unbounded allocation on the reader side.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Message, ProtoVersion};
+use crate::sock::send_all;
 
 /// Hard cap on a single frame's `frame_len`. 1 MiB is far larger than any
 /// legitimate handoff message; receipts above this are treated as malformed.
@@ -25,8 +27,8 @@ const LEN_PREFIX: usize = 4;
 /// Size of the `proto_version` field that lives inside `frame_len`.
 const VERSION_FIELD: usize = 2;
 
-/// Encode and write one `Message` to `w`. Flushes before returning.
-pub fn write_message<W: Write>(w: &mut W, version: ProtoVersion, msg: &Message) -> Result<()> {
+/// Encode one `Message` into a single contiguous frame buffer.
+fn encode(version: ProtoVersion, msg: &Message) -> Result<Vec<u8>> {
     let payload = postcard::to_allocvec(msg)?;
     let inner_len = VERSION_FIELD
         .checked_add(payload.len())
@@ -34,11 +36,36 @@ pub fn write_message<W: Write>(w: &mut W, version: ProtoVersion, msg: &Message) 
     if inner_len > MAX_FRAME_BYTES as usize {
         return Err(Error::FrameTooLarge(inner_len as u32));
     }
-    let frame_len = inner_len as u32;
-    w.write_all(&frame_len.to_le_bytes())?;
-    w.write_all(&version.to_le_bytes())?;
-    w.write_all(&payload)?;
+    let mut out = Vec::with_capacity(LEN_PREFIX + inner_len);
+    out.extend_from_slice(&(inner_len as u32).to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Encode and write one `Message` to `w`. Flushes before returning.
+///
+/// Prefer [`write_frame`] when the sink is the control socket: it cannot
+/// raise `SIGPIPE` and emits the frame in one syscall.
+pub fn write_message<W: Write>(w: &mut W, version: ProtoVersion, msg: &Message) -> Result<()> {
+    w.write_all(&encode(version, msg)?)?;
     w.flush()?;
+    Ok(())
+}
+
+/// Write one `Message` to a control socket as a single `send(2)`.
+///
+/// Two properties the generic [`write_message`] cannot offer:
+///
+/// - **No `SIGPIPE`.** See [`crate::sock::send_all`] — a peer that died mid
+///   handoff yields `EPIPE`, never a signal, whatever the embedding binary's
+///   signal disposition happens to be.
+/// - **One syscall per frame.** The three-`write_all` form could interleave
+///   with a heartbeat thread's frame if the single-writer contract were ever
+///   broken; a single `send` on a `SOCK_STREAM` Unix socket keeps the header
+///   and payload contiguous in the buffer under any write ordering.
+pub fn write_frame(stream: &UnixStream, version: ProtoVersion, msg: &Message) -> Result<()> {
+    send_all(stream, &encode(version, msg)?)?;
     Ok(())
 }
 
@@ -65,6 +92,104 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<(ProtoVersion, Message)> {
 
     let msg = postcard::from_bytes(&payload)?;
     Ok((version, msg))
+}
+
+/// Incremental frame reader for sockets that carry a receive timeout.
+///
+/// [`read_message`] is built on `read_exact`, which discards whatever it had
+/// already consumed when the read fails. On a socket armed with `SO_RCVTIMEO`
+/// that is a correctness bug, not just lost work: a frame that straddles the
+/// timeout boundary leaves the stream mid-frame, and the next read
+/// interprets payload bytes as a length prefix. Every subsequent frame is
+/// garbage — reported as a malformed frame or, worse, a plausible-looking
+/// message.
+///
+/// The accumulator owns the partial bytes instead, so a timeout is a
+/// *suspension*: the caller decides whether to keep waiting (peer is slow but
+/// alive, and the wall-clock budget has room) or give up, and a resumed read
+/// continues exactly where the previous one stopped.
+#[derive(Debug, Default)]
+pub struct FrameAccumulator {
+    buf: Vec<u8>,
+    /// Bytes needed for the frame in progress: [`LEN_PREFIX`] until the
+    /// length prefix has been parsed, `LEN_PREFIX + frame_len` after.
+    want: usize,
+}
+
+impl FrameAccumulator {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            want: LEN_PREFIX,
+        }
+    }
+
+    /// True if bytes of an incomplete frame are buffered. Callers use this to
+    /// distinguish "peer has gone silent" (nothing buffered — treat a timeout
+    /// as peer-dead) from "peer is mid-frame" (bytes buffered — the peer is
+    /// demonstrably alive, so keep reading until the wall-clock budget runs
+    /// out).
+    pub fn has_partial(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    /// Read toward the next complete message. Returns `Ok(None)` when the
+    /// read timed out (or would block) before the frame was complete; any
+    /// bytes consumed so far are retained for the next call.
+    pub fn poll_read<R: Read>(&mut self, r: &mut R) -> Result<Option<(ProtoVersion, Message)>> {
+        if self.want == 0 {
+            self.want = LEN_PREFIX;
+        }
+        loop {
+            while self.buf.len() < self.want {
+                let start = self.buf.len();
+                self.buf.resize(self.want, 0);
+                match r.read(&mut self.buf[start..]) {
+                    Ok(0) => {
+                        self.buf.truncate(start);
+                        return Err(Error::Io(std::io::Error::from(ErrorKind::UnexpectedEof)));
+                    }
+                    Ok(n) => self.buf.truncate(start + n),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {
+                        self.buf.truncate(start);
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        self.buf.truncate(start);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        self.buf.truncate(start);
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            if self.want == LEN_PREFIX {
+                let frame_len =
+                    u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+                if frame_len < VERSION_FIELD as u32 {
+                    self.reset();
+                    return Err(Error::FrameMalformed(frame_len));
+                }
+                if frame_len > MAX_FRAME_BYTES {
+                    self.reset();
+                    return Err(Error::FrameTooLarge(frame_len));
+                }
+                self.want = LEN_PREFIX + frame_len as usize;
+                continue;
+            }
+
+            let version = u16::from_le_bytes([self.buf[4], self.buf[5]]);
+            let decoded = postcard::from_bytes(&self.buf[LEN_PREFIX + VERSION_FIELD..]);
+            self.reset();
+            return Ok(Some((version, decoded?)));
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.want = LEN_PREFIX;
+    }
 }
 
 #[cfg(test)]
@@ -180,8 +305,129 @@ mod tests {
         assert!(read_message(&mut cursor).is_err());
     }
 
+    /// A reader that hands out `chunks` in order and reports `TimedOut` once
+    /// each chunk is exhausted — the shape a `SO_RCVTIMEO`-armed socket
+    /// presents when the writer is slow or a frame is split across segments.
+    struct ChunkedTimeoutReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        pending_timeout: bool,
+    }
+
+    impl ChunkedTimeoutReader {
+        fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                pending_timeout: false,
+            }
+        }
+    }
+
+    impl Read for ChunkedTimeoutReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending_timeout || self.chunks.is_empty() {
+                self.pending_timeout = false;
+                return Err(std::io::Error::from(ErrorKind::TimedOut));
+            }
+            let chunk = self
+                .chunks
+                .pop_front()
+                .expect("emptiness checked immediately above");
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            if n < chunk.len() {
+                self.chunks.push_front(chunk[n..].to_vec());
+            } else {
+                self.pending_timeout = true;
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn accumulator_resumes_a_frame_split_across_timeouts() {
+        let msg = Message::SealComplete {
+            handoff_id: HandoffId::new(),
+            last_revision_per_shard: vec![1, 2, 3],
+            data_dir_fingerprint: [9u8; 32],
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, PROTO_MAX, &msg).unwrap();
+
+        // Split mid-length-prefix and again mid-payload, with a receive
+        // timeout at each boundary: both points desynchronize a
+        // `read_exact`-based reader, which consumes the bytes it did get and
+        // then restarts parsing mid-frame on the next call.
+        let mut reader = ChunkedTimeoutReader::new([
+            bytes[..2].to_vec(),
+            bytes[2..7].to_vec(),
+            bytes[7..].to_vec(),
+        ]);
+
+        let mut acc = FrameAccumulator::new();
+        assert!(acc.poll_read(&mut reader).unwrap().is_none());
+        assert!(acc.has_partial(), "partial bytes must be retained");
+        assert!(acc.poll_read(&mut reader).unwrap().is_none());
+        assert!(acc.has_partial());
+        let (ver, decoded) = acc
+            .poll_read(&mut reader)
+            .unwrap()
+            .expect("frame completes once the last chunk arrives");
+        assert_eq!(ver, PROTO_MAX);
+        assert!(matches!(decoded, Message::SealComplete { .. }));
+        assert!(!acc.has_partial());
+
+        // Drained: a further poll is a plain timeout with nothing buffered,
+        // which is how callers recognize a silent peer as opposed to a slow
+        // one.
+        assert!(acc.poll_read(&mut reader).unwrap().is_none());
+        assert!(!acc.has_partial());
+    }
+
+    #[test]
+    fn accumulator_decodes_back_to_back_frames_from_one_chunk() {
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, PROTO_MAX, &Message::Heartbeat { ts_ms: 1 }).unwrap();
+        write_message(&mut bytes, PROTO_MAX, &Message::Heartbeat { ts_ms: 2 }).unwrap();
+        let mut reader = Cursor::new(bytes);
+        let mut acc = FrameAccumulator::new();
+        for expected in [1u64, 2] {
+            match acc.poll_read(&mut reader).unwrap() {
+                Some((_, Message::Heartbeat { ts_ms })) => assert_eq!(ts_ms, expected),
+                other => panic!("expected heartbeat {expected}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accumulator_rejects_malformed_length_and_resets() {
+        let mut buf = (MAX_FRAME_BYTES + 1).to_le_bytes().to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        let mut reader = Cursor::new(buf);
+        let mut acc = FrameAccumulator::new();
+        assert!(matches!(
+            acc.poll_read(&mut reader),
+            Err(Error::FrameTooLarge(_))
+        ));
+        // Reset after the error: no stale partial keeps the caller from
+        // reusing the accumulator on a fresh connection.
+        assert!(!acc.has_partial());
+    }
+
+    #[test]
+    fn accumulator_reports_eof_mid_frame() {
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, PROTO_MAX, &Message::Heartbeat { ts_ms: 1 }).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        let mut reader = Cursor::new(bytes);
+        let mut acc = FrameAccumulator::new();
+        match acc.poll_read(&mut reader) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
     proptest::proptest! {
-        /// Pure fuzz: `read_message` must never panic on any input bytes,
+        /// Pure fuzz: neither reader may panic on any input bytes,
         /// regardless of length, content, or alignment. The legal outcomes
         /// are `Ok(_)` (if the bytes happen to encode a valid frame) or
         /// `Err(_)` of any variant.
@@ -189,8 +435,11 @@ mod tests {
         fn read_message_never_panics_on_arbitrary_bytes(
             bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
         ) {
-            let mut cursor = Cursor::new(bytes);
+            let mut cursor = Cursor::new(bytes.clone());
             let _ = read_message(&mut cursor);
+            let mut cursor = Cursor::new(bytes);
+            let mut acc = FrameAccumulator::new();
+            let _ = acc.poll_read(&mut cursor);
         }
 
         /// Length prefix is honest: if we declare `frame_len = N` and feed
