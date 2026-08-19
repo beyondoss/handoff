@@ -11,7 +11,7 @@ rust-version = "1.92"
 # Published as `beyond-handoff`; internal members continue to refer to it as
 # `handoff` via the `package` rename so their `use handoff::*` statements
 # don't churn when the crate is renamed for crates.io.
-handoff = { path = "crates/handoff", version = "0.2.0", package = "beyond-handoff" }
+handoff = { path = "crates/handoff", version = "0.1.4", package = "beyond-handoff" }
 
 libc = "0.2"
 nix = { version = "0.30", default-features = false, features = ["fs", "socket", "uio", "process", "signal"] }
